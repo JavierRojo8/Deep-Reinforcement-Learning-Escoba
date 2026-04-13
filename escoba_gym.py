@@ -8,7 +8,7 @@ import pygame # Opcional, solo si vas a usar renderizado visual
 NUM_CARTAS = 40
 HAND_SIZE = 3
 MAX_TABLE_CARDS = 10
-NUM_CARACTERISTICAS_CARTA = 3  # [Valor_juego, es_oros, es_siete]
+NUM_CARACTERISTICAS_CARTA = 3  # [Valor_juego, es_oros, es_siete] — usado en _codificar_carta_visible
 
 # Mapeo de Posiciones (Codificación entera)
 POS_MAZO = 0 
@@ -30,17 +30,19 @@ class EscobaEnv(gym.Env):
         # Ejemplo: Un vector de 4 valores continuos (como posición y velocidad)
         # self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
         self.observation_space = spaces.Dict({
+            # IDs enteros de carta: 0 = ranura vacía, 1-40 = carta real (índice+1)
+            # El encoder aprendido convierte estos IDs en embeddings continuos.
             "hand": spaces.Box(
-                low=np.array([[0, 0, 0]] * HAND_SIZE),
-                high=np.array([[10, 1, 1]] * HAND_SIZE),
-                shape=(HAND_SIZE, 3),
-                dtype=np.int8
+                low=0,
+                high=NUM_CARTAS,
+                shape=(HAND_SIZE,),
+                dtype=np.int32
             ),
             "table": spaces.Box(
-                low=np.array([[0, 0, 0]] * MAX_TABLE_CARDS),
-                high=np.array([[10, 1, 1]] * MAX_TABLE_CARDS),
-                shape=(MAX_TABLE_CARDS, 3),
-                dtype=np.int8
+                low=0,
+                high=NUM_CARTAS,
+                shape=(MAX_TABLE_CARDS,),
+                dtype=np.int32
             ),
             "globales": spaces.Box(
                 low=0,
@@ -186,28 +188,29 @@ class EscobaEnv(gym.Env):
         return observation, info
 
     def _get_obs(self):
-        # -----------------------------
-        # HAND: up to 3 visible cards
-        # -----------------------------
-        obs_hand = np.zeros((HAND_SIZE, NUM_CARACTERISTICAS_CARTA), dtype=np.int8)
+        # ----------------------------------------------------------------
+        # HAND: IDs de carta (1-indexed; 0 = ranura vacía)
+        # El encoder aprendido se encarga de la representación continua.
+        # ----------------------------------------------------------------
+        obs_hand = np.zeros(HAND_SIZE, dtype=np.int32)
         indices_mano = np.where(self.posicion_cartas == POS_MI_MANO)[0]
         indices_mano = sorted(indices_mano, key=self._clave_orden_carta)
 
         for slot, idx in enumerate(indices_mano[:HAND_SIZE]):
-            obs_hand[slot] = self._codificar_carta_visible(idx)
+            obs_hand[slot] = int(idx) + 1  # 1-indexed
 
-        # -----------------------------
-        # TABLE: visible cards on table
-        # -----------------------------
-        obs_table = np.zeros((MAX_TABLE_CARDS, NUM_CARACTERISTICAS_CARTA), dtype=np.int8)
+        # ----------------------------------------------------------------
+        # TABLE: IDs de carta (1-indexed; 0 = ranura vacía)
+        # ----------------------------------------------------------------
+        obs_table = np.zeros(MAX_TABLE_CARDS, dtype=np.int32)
         indices_mesa = np.where(self.posicion_cartas == POS_MESA)[0]
-        indices_mesa = sorted(indices_mesa, key=self._clave_orden_carta) # Orden canónico de la mesa para consistencia
+        indices_mesa = sorted(indices_mesa, key=self._clave_orden_carta)
 
         suma_mesa = 0
         for slot, idx in enumerate(indices_mesa[:MAX_TABLE_CARDS]):
-            carta_codificada = self._codificar_carta_visible(idx)
-            obs_table[slot] = carta_codificada
-            suma_mesa += carta_codificada[0]  # valor_juego
+            obs_table[slot] = int(idx) + 1  # 1-indexed
+            _, _, valor_juego = self._obtener_info_carta(idx)
+            suma_mesa += valor_juego
 
         # -----------------------------
         # GLOBALS

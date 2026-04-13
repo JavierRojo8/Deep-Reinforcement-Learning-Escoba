@@ -6,12 +6,16 @@ from stable_baselines3 import PPO
 
 from escoba_gym import (
     EscobaEnv,
+    HAND_SIZE,
+    MAX_TABLE_CARDS,
     POS_MESA,
     POS_MI_MANO,
     POS_MIS_BAZAS,
     POS_OP_BAZAS,
     POS_MANO_OP,
 )
+# Necesario para que PPO.load() encuentre la clase del extractor
+from card_encoder import EscobaFeaturesExtractor  # noqa: F401
 
 MODEL_PATH = r"models\PPO\best_model2"
 WINDOW_W, WINDOW_H = 1400, 900
@@ -54,9 +58,10 @@ def sorted_table_indices(env: EscobaEnv):
 
 def build_obs_for_side(env: EscobaEnv, side: str):
     """
-    side = 'player' or 'opponent'
-    Builds the observation from that side's perspective so the same model
-    can be used as the opponent.
+    Construye la observación desde la perspectiva de 'player' u 'opponent'.
+    Usa IDs de carta (1-indexed, 0=vacío) — idéntico a EscobaEnv._get_obs().
+    Cuando side='opponent', se intercambian los roles tu/op en globales para
+    que el modelo (entrenado como jugador) reciba la perspectiva correcta.
     """
     assert side in ("player", "opponent")
 
@@ -66,33 +71,26 @@ def build_obs_for_side(env: EscobaEnv, side: str):
 
     table_indices = sorted_table_indices(env)
 
-    obs_hand = np.zeros((3, 3), dtype=np.int8)
-    for slot, idx in enumerate(hand_indices[:3]):
-        obs_hand[slot] = env._codificar_carta_visible(idx)
+    # ── Mano: IDs de carta (1-indexed) ─────────────────────────────────────
+    obs_hand = np.zeros(HAND_SIZE, dtype=np.int32)
+    for slot, idx in enumerate(hand_indices[:HAND_SIZE]):
+        obs_hand[slot] = int(idx) + 1
 
-    obs_table = np.zeros((10, 3), dtype=np.int8)
+    # ── Mesa: IDs de carta (1-indexed) ─────────────────────────────────────
+    obs_table = np.zeros(MAX_TABLE_CARDS, dtype=np.int32)
     suma_mesa = 0
-    for slot, idx in enumerate(table_indices[:10]):
-        enc = env._codificar_carta_visible(idx)
-        obs_table[slot] = enc
-        suma_mesa += int(enc[0])
+    for slot, idx in enumerate(table_indices[:MAX_TABLE_CARDS]):
+        obs_table[slot] = int(idx) + 1
+        _, _, valor_juego = env._obtener_info_carta(idx)
+        suma_mesa += valor_juego
 
+    # ── Globales: mismo orden que EscobaEnv._get_obs() ─────────────────────
+    # Para 'player': "tu" = jugador principal, "op" = rival.
+    # Para 'opponent': invertimos para que el modelo vea su propia perspectiva.
     c = env.contadores
+    n_table = len(table_indices)
+
     if side == "player":
-        obs_globales = np.array([
-            c["sietes_tu"],
-            c["sietes_op"],
-            c["cartas_tu"],
-            c["cartas_op"],
-            c["oros_tu"],
-            c["oros_op"],
-            c["tiene_7oro_tu"],
-            c["tiene_7oro_op"],
-            c["escobas_tu"],
-            c["escobas_op"],
-            suma_mesa
-        ], dtype=np.int16)
-    else:
         obs_globales = np.array([
             c["sietes_op"],
             c["sietes_tu"],
@@ -105,14 +103,30 @@ def build_obs_for_side(env: EscobaEnv, side: str):
             c["escobas_op"],
             c["escobas_tu"],
             len(env.mazo),
-            len(table_indices),
-            suma_mesa
+            n_table,
+            suma_mesa,
+        ], dtype=np.int16)
+    else:  # opponent: intercambiar tu↔op
+        obs_globales = np.array([
+            c["sietes_tu"],
+            c["sietes_op"],
+            c["cartas_tu"],
+            c["cartas_op"],
+            c["oros_tu"],
+            c["oros_op"],
+            c["tiene_7oro_tu"],
+            c["tiene_7oro_op"],
+            c["escobas_tu"],
+            c["escobas_op"],
+            len(env.mazo),
+            n_table,
+            suma_mesa,
         ], dtype=np.int16)
 
     return {
         "hand": obs_hand,
         "table": obs_table,
-        "globales": obs_globales
+        "globales": obs_globales,
     }
 
 

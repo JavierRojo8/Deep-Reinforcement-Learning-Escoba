@@ -11,6 +11,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
 
 from escoba_gym import EscobaEnv
+from card_encoder import EscobaFeaturesExtractor
 
 # ── Configuración centralizada ──────────────────────────────────────────────
 CONFIG = {
@@ -27,6 +28,10 @@ CONFIG = {
     "clip_range":       0.2,
     "eval_freq":        5_000,
     "n_eval_episodes":  20,
+    # ── Encoder de cartas (EscobaFeaturesExtractor) ──────────────────────────
+    "embed_dim":        16,   # dimensión del embedding por carta
+    "hidden_dim":       32,   # dimensión de la MLP por carta
+    "features_dim":     64,   # dimensión del vector latente final
 }
 
 LOG_DIR    = "logs"       # TensorBoard logs  →  logs/PPO_N/
@@ -152,9 +157,19 @@ def entrenar():
     )
 
     # ── Modelo ──────────────────────────────────────────────────────────────
+    policy_kwargs = dict(
+        features_extractor_class=EscobaFeaturesExtractor,
+        features_extractor_kwargs=dict(
+            embed_dim=CONFIG["embed_dim"],
+            hidden_dim=CONFIG["hidden_dim"],
+            features_dim=CONFIG["features_dim"],
+        ),
+    )
+
     model = PPO(
         CONFIG["policy"],
         env,
+        policy_kwargs=policy_kwargs,
         verbose=0,
         tensorboard_log=LOG_DIR,          # SB3 crea logs/PPO_N/
         learning_rate=CONFIG["learning_rate"],
