@@ -15,7 +15,7 @@ from card_encoder import EscobaFeaturesExtractor
 
 # ── Configuración centralizada ──────────────────────────────────────────────
 CONFIG = {
-    "total_timesteps":  4_000_000,
+    "total_timesteps":  200_000_000,
     "opponent_type":    "greedy",          # "random" | "greedy" | "model"
     "policy":           "MultiInputPolicy",
     "learning_rate":    3e-4,
