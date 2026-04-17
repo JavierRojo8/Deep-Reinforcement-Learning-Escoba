@@ -25,7 +25,8 @@ class EscobaEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
 
     def __init__(self, render_mode=None, config_param=None,
-                 opponent_type="random", opponent_model=None):
+                 opponent_type="random", opponent_model=None,
+                 boss_deterministic=True):
         # 1. Definir el espacio de observación (Inputs del agente)
         # Ejemplo: Un vector de 4 valores continuos (como posición y velocidad)
         # self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32)
@@ -78,8 +79,9 @@ class EscobaEnv(gym.Env):
         #                 solo se usa cuando opponent_type == "model"
         if opponent_type not in ("random", "greedy", "model"):
             raise ValueError(f"opponent_type debe ser 'random', 'greedy' o 'model', no '{opponent_type}'")
-        self.opponent_type  = opponent_type
-        self.opponent_model = opponent_model
+        self.opponent_type       = opponent_type
+        self.opponent_model      = opponent_model
+        self._boss_deterministic = boss_deterministic
             
 
     
@@ -520,29 +522,74 @@ class EscobaEnv(gym.Env):
 
         return min(indices_mano, key=prioridad)
 
-    # ── Estrategia 3: MODEL (stub para uso futuro) ────────────────────────────
+    # ── Helper: observación desde la perspectiva del oponente ───────────────
+    def _get_obs_opponent(self):
+        """
+        Construye la observación desde la perspectiva del oponente (para self-play).
+        Mismo formato que _get_obs() pero con mano = POS_MANO_OP y globales con
+        tu↔op intercambiados, de modo que el boss recibe exactamente el mismo tipo
+        de observación con el que fue entrenado.
+        """
+        obs_hand = np.zeros(HAND_SIZE, dtype=np.int32)
+        indices_mano_op = np.where(self.posicion_cartas == POS_MANO_OP)[0]
+        indices_mano_op = sorted(indices_mano_op, key=self._clave_orden_carta)
+        for slot, idx in enumerate(indices_mano_op[:HAND_SIZE]):
+            obs_hand[slot] = int(idx) + 1
+
+        obs_table = np.zeros(MAX_TABLE_CARDS, dtype=np.int32)
+        indices_mesa = np.where(self.posicion_cartas == POS_MESA)[0]
+        indices_mesa = sorted(indices_mesa, key=self._clave_orden_carta)
+        suma_mesa = 0
+        for slot, idx in enumerate(indices_mesa[:MAX_TABLE_CARDS]):
+            obs_table[slot] = int(idx) + 1
+            _, _, valor_juego = self._obtener_info_carta(idx)
+            suma_mesa += valor_juego
+
+        # Globales con tu↔op invertidos: para el boss, POS_MANO_OP es "tu"
+        obs_globales = np.array([
+            self.contadores["sietes_tu"],       # 0  ("op" del boss = jugador principal)
+            self.contadores["sietes_op"],       # 1  ("tu" del boss = él mismo)
+            self.contadores["cartas_tu"],       # 2
+            self.contadores["cartas_op"],       # 3
+            self.contadores["oros_tu"],         # 4
+            self.contadores["oros_op"],         # 5
+            self.contadores["tiene_7oro_tu"],   # 6
+            self.contadores["tiene_7oro_op"],   # 7
+            self.contadores["escobas_tu"],      # 8
+            self.contadores["escobas_op"],      # 9
+            len(self.mazo),                     # 10
+            len(indices_mesa),                  # 11
+            suma_mesa,                          # 12
+        ], dtype=np.int16)
+
+        return {"hand": obs_hand, "table": obs_table, "globales": obs_globales}
+
+    # ── Estrategia 3: MODEL ──────────────────────────────────────────────────
     def _turno_oponente_model(self):
-        """
-        Usa self.opponent_model (una política PPO cargada externamente) para
-        decidir la carta a jugar desde la perspectiva del oponente.
-
-        Para activarlo en el futuro:
-          1. Construye la observación del oponente (intercambiando tu/op).
-          2. Llama a self.opponent_model.predict(obs, deterministic=True).
-          3. Ejecuta la acción igual que lo haría el jugador principal.
-
-        Por ahora cae en random como fallback.
-        """
+        """Usa self.opponent_model para decidir la jugada del oponente."""
         if self.opponent_model is None:
-            # Fallback seguro hasta que se implemente
             self._turno_oponente_random()
             return
 
-        # TODO: construir obs desde perspectiva del oponente y predecir acción
-        raise NotImplementedError(
-            "opponent_type='model' requiere implementar la obs desde perspectiva "
-            "del oponente. Ver build_obs_for_side() en play_vs_model.py como referencia."
-        )
+        indices_mano_op = np.where(self.posicion_cartas == POS_MANO_OP)[0]
+        if len(indices_mano_op) == 0:
+            return
+
+        obs_op = self._get_obs_opponent()
+        action, _ = self.opponent_model.predict(obs_op, deterministic=self._boss_deterministic)
+        action = int(action)
+        action = min(action, len(indices_mano_op) - 1)
+
+        indices_mano_op = sorted(indices_mano_op, key=self._clave_orden_carta)
+        carta_idx = indices_mano_op[action]
+        _, _, valor_c = self._obtener_info_carta(carta_idx)
+        indices_mesa = np.where(self.posicion_cartas == POS_MESA)[0]
+        combo = self._buscar_mejor_jugada(valor_c, indices_mesa)
+
+        if combo is not None:
+            self._ejecutar_captura_oponente(carta_idx, combo)
+        else:
+            self.posicion_cartas[carta_idx] = POS_MESA
 
     def _repartir_nueva_ronda(self):
         """
