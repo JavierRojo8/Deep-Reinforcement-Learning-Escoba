@@ -3,6 +3,7 @@ import glob
 import json
 import logging
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -284,12 +285,16 @@ class EscobaStatsCallback(BaseCallback):
     También mantiene self.history para generar gráficas al final.
     """
 
+    # Máximo de episodios que se guardan en memoria para las gráficas finales.
+    # Con ~18 pasos/episodio y 200M steps hay ~11M episodios; sin este cap la
+    # lista crece indefinidamente y provoca OOM. 200k episodios ≈ 50 MB.
+    _HISTORY_MAXLEN = 200_000
+
     def __init__(self, boss_manager: Optional[BossManager] = None, verbose: int = 0):
         super().__init__(verbose)
         self.boss_manager = boss_manager
         self._reset_rollout_buffers()
-        # Historia completa: lista de dicts por episodio
-        self.history: list = []
+        self.history: deque = deque(maxlen=self._HISTORY_MAXLEN)
 
     def _reset_rollout_buffers(self):
         self._wins     = []

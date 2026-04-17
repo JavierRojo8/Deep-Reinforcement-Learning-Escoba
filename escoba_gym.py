@@ -621,7 +621,13 @@ class EscobaEnv(gym.Env):
             return
 
         if self.ultimo_en_bazar is None:
-            return  # o decide una regla explícita
+            # Nadie hizo una baza en toda la partida: se las lleva quien tiene más cartas,
+            # o el jugador principal en caso de empate (desempate arbitrario pero consistente).
+            self.ultimo_en_bazar = (
+                "oponente"
+                if self.contadores["cartas_op"] > self.contadores["cartas_tu"]
+                else "jugador"
+            )
         
         destino = POS_MIS_BAZAS if self.ultimo_en_bazar == "jugador" else POS_OP_BAZAS
         self.posicion_cartas[indices_mesa] = destino
