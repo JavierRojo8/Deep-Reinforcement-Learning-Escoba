@@ -10,19 +10,31 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
 
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
+from stable_baselines3.common.utils import set_random_seed
+
 from escoba_gym import EscobaEnv
 from card_encoder import EscobaFeaturesExtractor
 
 # ── Configuración centralizada ──────────────────────────────────────────────
 CONFIG = {
-    "total_timesteps":  200_000_000,
-    "opponent_type":    "greedy",          # "random" | "greedy" | "model"
+    "total_timesteps":  250_000_000,
+    "opponent_type":    "mixed",          # Ahora usamos el oponente mixto
+    "curriculum_schedule": [
+        # (Paso de entrenamiento, Probabilidad de ser Greedy)
+        (0,          0.0),   # 0 a 20M:   100% Random
+        (40_000_000, 0.2),   # 20M a 40M: 20% Greedy
+        (60_000_000, 0.4),   # 40M a 60M: 40% Greedy
+        (80_000_000, 0.6),   # 60M a 80M: 60% Greedy
+        (120_000_000, 0.8),   # 80M a 100M: 80% Greedy
+        (160_000_000, 1.0),   # 100M+:      100% Greedy
+    ],
     "policy":           "MultiInputPolicy",
-    "learning_rate":    3e-4,
-    "n_steps":          256,
-    "batch_size":       256,
+    "learning_rate":    5e-4,
+    "n_steps":          1024,
+    "batch_size":       512,
     "n_epochs":         10,
-    "ent_coef":         0.01,
+    "ent_coef":         0.05,
     "gamma":            0.99,
     "gae_lambda":       0.95,
     "clip_range":       0.2,
@@ -31,11 +43,23 @@ CONFIG = {
     # ── Encoder de cartas (EscobaFeaturesExtractor) ──────────────────────────
     "embed_dim":        16,   # dimensión del embedding por carta
     "hidden_dim":       32,   # dimensión de la MLP por carta
-    "features_dim":     64,   # dimensión del vector latente final
+    "features_dim":     16,   # dimensión del vector latente final
+    "num_envs":         32,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
 }
 
 LOG_DIR    = "logs"       # TensorBoard logs  →  logs/PPO_N/
 MODELS_DIR = "models/PPO" # Modelos guardados →  models/PPO/PPO_N/
+
+
+def make_env(env_id, opponent_type, seed=0):
+    """
+    Función de utilidad para crear instancias independientes del entorno en diferentes procesos.
+    """
+    def _init():
+        env = EscobaEnv(render_mode=None, opponent_type=opponent_type)
+        env.reset(seed=seed + env_id)
+        return env
+    return _init
 
 
 # ── Callback de métricas de juego ───────────────────────────────────────────
@@ -105,6 +129,33 @@ class EscobaStatsCallback(BaseCallback):
         self._reset_buffers()
 
 
+class CurriculumCallback(BaseCallback):
+    """
+    Sube gradualmente la probabilidad de que el oponente juegue en modo 'greedy'
+    siguiendo un calendario de (timestep, prob_greedy).
+    """
+    def __init__(self, schedule: list, verbose: int = 0):
+        super().__init__(verbose)
+        # Ordenar por timestep para asegurar la secuencia correcta
+        self.schedule = sorted(schedule, key=lambda x: x[0])
+        self.current_phase_idx = 0
+
+    def _on_step(self) -> bool:
+        # Verificar si hemos cruzado el umbral del SIGUIENTE paso en el calendario
+        if self.current_phase_idx < len(self.schedule) - 1:
+            next_step, next_prob = self.schedule[self.current_phase_idx + 1]
+            
+            if self.num_timesteps >= next_step:
+                self.current_phase_idx += 1
+                if self.verbose > 0:
+                    print(f"\n[Curriculum] Paso {self.num_timesteps:,} alcanzado.")
+                    print(f"Subiendo dificultad: Oponente ahora es {next_prob*100:.0f}% Greedy.\n")
+                
+                # Actualizar la probabilidad en todos los entornos vectorizados
+                self.training_env.env_method("set_prob_greedy", next_prob)
+                
+        return True
+
 def _next_ppo_run_name() -> str:
     """Devuelve el nombre del próximo run (PPO_N) que SB3 va a crear en logs/."""
     existing = glob.glob(os.path.join(LOG_DIR, "PPO_*"))
@@ -116,6 +167,8 @@ def _next_ppo_run_name() -> str:
             pass
     next_n = max(nums, default=0) + 1
     return f"PPO_{next_n}"
+
+
 
 
 def entrenar():
@@ -145,16 +198,18 @@ def entrenar():
     with open(config_path, "w") as f:
         json.dump({**CONFIG, "run_name": run_name, "started_at": datetime.now().isoformat()}, f, indent=2)
 
-    # ── Entornos ────────────────────────────────────────────────────────────
+    # ── Entornos Paralelizados ──────────────────────────────────────────────
     opp = CONFIG["opponent_type"]
-    env = Monitor(
-        EscobaEnv(render_mode=None, opponent_type=opp),
-        filename=os.path.join(model_dir, "train_monitor.csv")
-    )
-    eval_env = Monitor(
-        EscobaEnv(render_mode=None, opponent_type=opp),
-        filename=os.path.join(model_dir, "eval_monitor.csv")
-    )
+    num_envs = CONFIG["num_envs"]
+    
+    # Entorno de entrenamiento paralelizado (arranca en "mixed")
+    env = SubprocVecEnv([make_env(i, opp) for i in range(num_envs)])
+    env = VecMonitor(env, os.path.join(model_dir, "train_monitor"))
+
+    # IMPORTANTE: El evaluador SIEMPRE juega contra 100% greedy para tener 
+    # una métrica de rendimiento "real" que no dependa de la fase curricular.
+    eval_env = DummyVecEnv([make_env(99, "greedy")])
+    eval_env = VecMonitor(eval_env, os.path.join(model_dir, "eval_monitor"))
 
     # ── Modelo ──────────────────────────────────────────────────────────────
     policy_kwargs = dict(
@@ -194,6 +249,12 @@ def entrenar():
         verbose=0,
     )
     stats_callback = EscobaStatsCallback()
+    
+    # Instanciamos el nuevo callback con el calendario
+    curriculum_callback = CurriculumCallback(
+        schedule=CONFIG["curriculum_schedule"], 
+        verbose=1
+    )
 
     # ── Entrenar ────────────────────────────────────────────────────────────
     logger.info(f"Iniciando entrenamiento: {CONFIG['total_timesteps']:,} pasos…")
@@ -201,7 +262,7 @@ def entrenar():
 
     model.learn(
         total_timesteps=CONFIG["total_timesteps"],
-        callback=[eval_callback, stats_callback],
+        callback=[eval_callback, stats_callback, curriculum_callback],
         tb_log_name="PPO",               # SB3 crea logs/PPO_N (N = run_name)
         progress_bar=True,
     )

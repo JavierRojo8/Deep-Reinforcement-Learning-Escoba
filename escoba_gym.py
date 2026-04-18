@@ -18,6 +18,17 @@ POS_MIS_BAZAS = 3
 POS_OP_BAZAS = 4
 POS_MANO_OP = 5    # Cartas que se ha llevado el oponente
 
+_NUMEROS_REALES = np.zeros(NUM_CARTAS, dtype=int)
+_ES_ORO = np.zeros(NUM_CARTAS, dtype=int)
+_VALORES_JUEGO = np.zeros(NUM_CARTAS, dtype=int)
+
+for i in range(NUM_CARTAS):
+    palo = i // 10
+    idx_relativo = i % 10
+    _ES_ORO[i] = 1 if palo == 0 else 0
+    _NUMEROS_REALES[i] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12][idx_relativo]
+    _VALORES_JUEGO[i] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10][idx_relativo]
+
 class EscobaEnv(gym.Env):
     """
     Entorno personalizado para el juego de la Escoba.
@@ -73,36 +84,21 @@ class EscobaEnv(gym.Env):
         self.render_mode = render_mode
 
         # ── NUEVO: tipo de oponente ──────────────────────────────────────────
-        # opponent_type: "random" | "greedy" | "model"
-        # opponent_model: instancia de PPO (u otro) cargada externamente,
-        #                 solo se usa cuando opponent_type == "model"
-        if opponent_type not in ("random", "greedy", "model"):
-            raise ValueError(f"opponent_type debe ser 'random', 'greedy' o 'model', no '{opponent_type}'")
-        self.opponent_type  = opponent_type
+        # opponent_type: "random" | "greedy" | "model" | "mixed"
+        if opponent_type not in ("random", "greedy", "model", "mixed"):
+            raise ValueError(f"opponent_type debe ser 'random', 'greedy', 'model' o 'mixed'")
+        
+        self.opponent_type = opponent_type
         self.opponent_model = opponent_model
+        self.prob_greedy = 0.0  # Por defecto arranca en 0.0 (100% random)
             
 
     
     def _obtener_info_carta(self, indice_absoluto):
         """
-        Convierte un índice (0-39) en características de la carta.
-        Retorna: (numero_real, es_oros, valor_juego)
+        Lectura O(1) desde los arrays precomputados.
         """
-        palo = indice_absoluto // 10  # 0: Oros, 1: Copas, 2: Espadas, 3: Bastos
-        indice_relativo = indice_absoluto % 10 # 0 a 9
-        
-        es_oros = 1 if palo == 0 else 0
-        
-        # Mapeo de índices a números escritos en la carta
-        # 0->1, 1->2, ..., 6->7, 7->10 (Sota), 8->11 (Caballo), 9->12 (Rey)
-        numeros_carta = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12]
-        numero_real = numeros_carta[indice_relativo]
-        
-        # Mapeo de índices a valor para sumar 15 (La Sota vale 8, Caballo 9, Rey 10)
-        valores_juego = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        valor_juego = valores_juego[indice_relativo]
-        
-        return numero_real, es_oros, valor_juego
+        return _NUMEROS_REALES[indice_absoluto], _ES_ORO[indice_absoluto], _VALORES_JUEGO[indice_absoluto]
 
     def _codificar_carta_visible(self, indice_absoluto):
         """
@@ -243,57 +239,49 @@ class EscobaEnv(gym.Env):
 
     def _buscar_mejor_jugada(self, valor_carta_jugada, cartas_mesa_indices):
         """
-        Busca todas las combinaciones de cartas en la mesa que, sumadas a la carta
-        jugada, den 15. Devuelve la mejor combinación según heurística.
+        Búsqueda optimizada mediante bitmasks en lugar de itertools.
         """
         target = 15 - valor_carta_jugada
-        
-        # Si la carta sola ya vale más de 15 (imposible en escoba normal) o target < 0
         if target < 0:
             return None
 
-        candidatos = []
-
-        # Buscar subconjuntos que sumen 'target'
-        # Probamos combinaciones de tamaño 1 hasta el total de cartas en mesa
-        for r in range(1, len(cartas_mesa_indices) + 1):
-            for combo_indices in itertools.combinations(cartas_mesa_indices, r):
-                # Calcular suma de esta combinación
-                suma_combo = 0
-                for idx in combo_indices:
-                    _, _, v = self._obtener_info_carta(idx)
-                    suma_combo += v
-                
-                if suma_combo == target:
-                    candidatos.append(combo_indices)
-
-        if not candidatos:
+        n_mesa = len(cartas_mesa_indices)
+        if n_mesa == 0:
             return None
 
-        # ELEGIR LA MEJOR COMBINACIÓN
-        # Criterios: Escoba > 7 Velo (7 Oros) > Más 7s > Más Oros > Más Cartas
+        # Obtenemos los valores de la mesa rápidamente
+        valores_mesa = _VALORES_JUEGO[cartas_mesa_indices]
+        
         mejor_score = -1
         mejor_combo = None
 
-        for combo in candidatos:
-            score = 0
-            # Info detallada de las cartas que nos llevamos
-            cartas_combo = [self._obtener_info_carta(i) for i in combo]
+        # Evaluamos todas las combinaciones posibles usando una máscara de bits (1 a 2^n_mesa - 1)
+        for mask in range(1, 1 << n_mesa):
+            suma = 0
+            # Suma rápida iterando sobre los bits activos
+            for i in range(n_mesa):
+                if (mask & (1 << i)):
+                    suma += valores_mesa[i]
             
-            # 1. ¿Es Escoba? (Si nos llevamos todas las de la mesa)
-            if len(combo) == len(cartas_mesa_indices):
-                score += 1000 
-            
-            # 2. Análisis de cartas individuales en el combo
-            for (num, es_oro, _) in cartas_combo:
-                if num == 7 and es_oro == 1: score += 150 # El 7 de oros vale mucho
-                if num == 7: score += 50                  # Los 7s valen
-                if es_oro: score += 20                    # Los oros valen
-                score += 1                                # Cantidad de cartas vale
-            
-            if score > mejor_score:
-                mejor_score = score
-                mejor_combo = combo
+            # Si suma 15, evaluamos el score inmediatamente para no guardar listas en memoria
+            if suma == target:
+                combo_actual = [cartas_mesa_indices[i] for i in range(n_mesa) if (mask & (1 << i))]
+                
+                score = 0
+                if len(combo_actual) == n_mesa: 
+                    score += 1000 # Escoba
+                
+                for idx in combo_actual:
+                    n = _NUMEROS_REALES[idx]
+                    oro = _ES_ORO[idx]
+                    if n == 7 and oro: score += 150
+                    if n == 7: score += 50
+                    if oro: score += 20
+                    score += 1
+                
+                if score > mejor_score:
+                    mejor_score = score
+                    mejor_combo = tuple(combo_actual)
 
         return mejor_combo
 
@@ -318,7 +306,9 @@ class EscobaEnv(gym.Env):
             # Caso borde: No quedan cartas, no debería pasar si se controla bien el loop
             return self._get_obs(), 0, True, False, {}
 
-        # Si la acción pide la carta 2 pero solo tengo 1 carta, uso la última disponible
+        if action >= len(indices_mano):
+            reward -= 0.5  # Dolor por acción inválida
+            
         idx_real_accion = min(action, len(indices_mano) - 1)
         carta_jugada_idx = indices_mano[idx_real_accion]
         
@@ -374,7 +364,8 @@ class EscobaEnv(gym.Env):
         # 3. TURNO DEL OPONENTE (Simulado/Aleatorio por ahora)
         # Aquí deberías implementar una IA simple para el rival o jugar una carta random.
         # Para este esqueleto, simplemente movemos una carta del rival a la mesa o hacemos que juegue.
-        self._simular_turno_oponente()
+        penalty_oponente = self._simular_turno_oponente()
+        reward += penalty_oponente
 
         # 4. GESTIÓN DE RONDAS (REPARTIR)
         # Verificar si ambos jugadores se quedaron sin cartas en mano
@@ -401,44 +392,70 @@ class EscobaEnv(gym.Env):
         info = self._get_info()
         
         return observation, reward, terminated, truncated, info
+    
+    def set_opponent(self, opponent_type):
+        """Permite cambiar el tipo de oponente a mitad del entrenamiento."""
+        if opponent_type in ("random", "greedy", "model", "mixed"):
+            self.opponent_type = opponent_type
+
+    def set_prob_greedy(self, prob: float):
+        """Ajusta la probabilidad de que el oponente mixto juegue modo greedy."""
+        self.prob_greedy = prob
 
     # -----------------------------------------------------------
     # TURNO DEL OPONENTE: dispatcher + estrategias
     # -----------------------------------------------------------
 
     def _simular_turno_oponente(self):
-        """Delega al método correspondiente según self.opponent_type."""
+        """Delega al método correspondiente y devuelve la penalización generada."""
         if self.opponent_type == "random":
-            self._turno_oponente_random()
+            return self._turno_oponente_random()
         elif self.opponent_type == "greedy":
-            self._turno_oponente_greedy()
-        elif self.opponent_type == "model":
-            self._turno_oponente_model()
+            return self._turno_oponente_greedy()
+        elif self.opponent_type == "mixed":
+            return self._turno_oponente_mezclado()
+        return 0.0
+
+    def _turno_oponente_mezclado(self):
+        if self.np_random.random() < self.prob_greedy:
+            return self._turno_oponente_greedy()
+        else:
+            return self._turno_oponente_random()
 
     # ── Helper compartido: ejecuta una captura del oponente ─────────────────
     def _ejecutar_captura_oponente(self, carta_idx, combo_indices):
-        """Mueve cartas a POS_OP_BAZAS, actualiza contadores y chequea escoba."""
+        """Mueve cartas a POS_OP_BAZAS, actualiza contadores y CALCULA PENALIZACIÓN."""
         cartas_a_mover = list(combo_indices) + [carta_idx]
         self.posicion_cartas[cartas_a_mover] = POS_OP_BAZAS
+        
+        penalty = 0.0
 
         if np.count_nonzero(self.posicion_cartas == POS_MESA) == 0:
             self.contadores["escobas_op"] += 1
+            penalty -= 1.0  # ¡Castigo inmediato si el oponente hace escoba!
 
         for idx in cartas_a_mover:
             n, oro, _ = self._obtener_info_carta(idx)
             self.contadores["cartas_op"] += 1
-            if oro: self.contadores["oros_op"] += 1
-            if n == 7: self.contadores["sietes_op"] += 1
-            if n == 7 and oro: self.contadores["tiene_7oro_op"] = 1
+            penalty -= 0.05 # Castigo por cada carta que nos roban
+            if oro: 
+                self.contadores["oros_op"] += 1
+                penalty -= 0.1
+            if n == 7: 
+                self.contadores["sietes_op"] += 1
+                penalty -= 0.2
+            if n == 7 and oro: 
+                self.contadores["tiene_7oro_op"] = 1
 
         self.ultimo_en_bazar = "oponente"
+        return penalty
 
     # ── Estrategia 1: RANDOM ─────────────────────────────────────────────────
     def _turno_oponente_random(self):
         """Elige una carta al azar; captura si puede (usando greedy de combos)."""
         indices_mano_op = np.where(self.posicion_cartas == POS_MANO_OP)[0]
         if len(indices_mano_op) == 0:
-            return
+            return 0.0  # <--- AÑADIDO: Si no tiene cartas, penalización 0
 
         carta_idx = self.np_random.choice(indices_mano_op)
         _, _, valor_c = self._obtener_info_carta(carta_idx)
@@ -446,9 +463,11 @@ class EscobaEnv(gym.Env):
         combo         = self._buscar_mejor_jugada(valor_c, indices_mesa)
 
         if combo is not None:
-            self._ejecutar_captura_oponente(carta_idx, combo)
+            # <--- AÑADIDO: Retornar lo que devuelve la captura
+            return self._ejecutar_captura_oponente(carta_idx, combo)
         else:
             self.posicion_cartas[carta_idx] = POS_MESA
+            return 0.0  # <--- AÑADIDO: Si solo deja la carta en la mesa, penalización 0
 
     # ── Estrategia 2: GREEDY ─────────────────────────────────────────────────
     def _turno_oponente_greedy(self):
@@ -456,14 +475,10 @@ class EscobaEnv(gym.Env):
         Mira todas las cartas de su mano, evalúa la mejor captura posible
         para cada una y elige la jugada de mayor valor.
         Si ninguna carta captura, descarta la carta menos valiosa.
-
-        Prioridades (mismo criterio que _buscar_mejor_jugada, aplicado
-        también a la carta jugada):
-          escoba > 7 de oros > sietes > oros > cantidad de cartas
         """
         indices_mano_op = np.where(self.posicion_cartas == POS_MANO_OP)[0]
         if len(indices_mano_op) == 0:
-            return
+            return 0.0  # <--- Si no tiene cartas, penalización 0
 
         indices_mesa = np.where(self.posicion_cartas == POS_MESA)[0]
 
@@ -483,11 +498,13 @@ class EscobaEnv(gym.Env):
                 mejor_combo = combo
 
         if mejor_carta is not None:
-            self._ejecutar_captura_oponente(mejor_carta, mejor_combo)
+            # Retornar lo que devuelve la captura
+            return self._ejecutar_captura_oponente(mejor_carta, mejor_combo)
         else:
             # Ninguna carta puede capturar → descartar la menos valiosa
             carta_a_tirar = self._elegir_carta_a_tirar(indices_mano_op)
             self.posicion_cartas[carta_a_tirar] = POS_MESA
+            return 0.0  # Si solo deja la carta, penalización 0
 
     def _puntuar_jugada_greedy(self, carta_idx, combo_indices, indices_mesa):
         """
@@ -508,6 +525,17 @@ class EscobaEnv(gym.Env):
             score += 1
 
         return score
+
+    def _elegir_carta_a_tirar(self, indices_mano):
+        """
+        Cuando no hay captura posible, elige la carta menos valiosa para dejar
+        en mesa: evita oros y sietes; entre el resto, prefiere valor bajo.
+        """
+        def prioridad(idx):
+            n, oro, v = self._obtener_info_carta(idx)
+            return oro * 100 + int(n == 7) * 50 + v  # menor → mejor para tirar
+
+        return min(indices_mano, key=prioridad)
 
     def _elegir_carta_a_tirar(self, indices_mano):
         """
