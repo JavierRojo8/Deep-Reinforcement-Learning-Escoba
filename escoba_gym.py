@@ -69,6 +69,12 @@ class EscobaEnv(gym.Env):
                 ]),
                 shape=(13,),
                 dtype=np.int16
+            ),
+            "played_cards": spaces.Box(
+                low=0,
+                high=1,
+                shape=(NUM_CARTAS,),
+                dtype=np.int8
             )
         })
 
@@ -226,13 +232,19 @@ class EscobaEnv(gym.Env):
             len(indices_mesa),                 # 11 cartas en mesa
             suma_mesa                          # 12 suma de valores en mesa
         ], dtype=np.int16)
+        
+        # --- NUEVO: Memoria de cartas ya capturadas ---
+        obs_played = np.zeros(NUM_CARTAS, dtype=np.int8)
+        # Marcamos como 1 las cartas que están en MIS BAZAS o OP_BAZAS
+        capturadas = (self.posicion_cartas == POS_MIS_BAZAS) | (self.posicion_cartas == POS_OP_BAZAS)
+        obs_played[capturadas] = 1
 
         return {
             "hand": obs_hand,
             "table": obs_table,
-            "globales": obs_globales
+            "globales": obs_globales,
+            "played_cards": obs_played  # Añadimos al diccionario final
         }
-
     # -----------------------------------------------------------
     # LÓGICA DE COMBINATORIA Y PUNTUACIÓN (GREEDY)
     # -----------------------------------------------------------

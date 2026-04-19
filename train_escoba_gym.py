@@ -18,7 +18,7 @@ from card_encoder import EscobaFeaturesExtractor
 
 # ── Configuración centralizada ──────────────────────────────────────────────
 CONFIG = {
-    "total_timesteps":  250_000_000,
+    "total_timesteps":  400_000_000,
     "opponent_type":    "mixed",          # Ahora usamos el oponente mixto
     "curriculum_schedule": [
         # (Paso de entrenamiento, Probabilidad de ser Greedy)
@@ -30,11 +30,9 @@ CONFIG = {
         (160_000_000, 1.0),   # 100M+:      100% Greedy
     ],
     "policy":           "MultiInputPolicy",
-    "learning_rate":    5e-4,
     "n_steps":          1024,
     "batch_size":       512,
     "n_epochs":         10,
-    "ent_coef":         0.05,
     "gamma":            0.99,
     "gae_lambda":       0.95,
     "clip_range":       0.2,
@@ -43,13 +41,30 @@ CONFIG = {
     # ── Encoder de cartas (EscobaFeaturesExtractor) ──────────────────────────
     "embed_dim":        16,   # dimensión del embedding por carta
     "hidden_dim":       32,   # dimensión de la MLP por carta
-    "features_dim":     16,   # dimensión del vector latente final
-    "num_envs":         32,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
+    "features_dim":     32,   # dimensión del vector latente final
+    "num_envs":         64,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
+    # ── Hiperparámetros Dinámicos (Schedulers) ─────────────────────────
+    "learning_rate_init": 5e-4,
+    "learning_rate_end":  1e-4,   # Bajará poco a poco hasta casi cero
+    
+    "ent_coef_init":      0.04,
+    "ent_coef_end":       0.008,  # Al final, jugará casi 100% de memoria, sin azar
+    "ent_decay_start":    80_000_000,   # Empieza a bajar cuando el rival es 60% greedy
+    "ent_decay_end":      220_000_000,  # Termina de bajar casi al final
 }
 
 LOG_DIR    = "logs"       # TensorBoard logs  →  logs/PPO_N/
 MODELS_DIR = "models/PPO" # Modelos guardados →  models/PPO/PPO_N/
 
+def linear_schedule(initial_value: float, final_value: float = 0.0):
+    """
+    Devuelve una función que calcula un valor linealmente decreciente,
+    ideal para el learning_rate en Stable-Baselines3.
+    """
+    def func(progress_remaining: float) -> float:
+        # progress_remaining va de 1.0 (inicio) a 0.0 (fin)
+        return progress_remaining * (initial_value - final_value) + final_value
+    return func
 
 def make_env(env_id, opponent_type, seed=0):
     """
@@ -156,6 +171,34 @@ class CurriculumCallback(BaseCallback):
                 
         return True
 
+class DynamicEntCoefCallback(BaseCallback):
+    """
+    Baja el coeficiente de entropía linealmente a medida que avanza el entrenamiento.
+    """
+    def __init__(self, init_ent, end_ent, start_step, end_step, verbose=0):
+        super().__init__(verbose)
+        self.init_ent = init_ent
+        self.end_ent = end_ent
+        self.start_step = start_step
+        self.end_step = end_step
+
+    def _on_step(self) -> bool:
+        # Calcular el valor actual según el timestep
+        if self.num_timesteps <= self.start_step:
+            current_ent = self.init_ent
+        elif self.num_timesteps >= self.end_step:
+            current_ent = self.end_ent
+        else:
+            progress = (self.num_timesteps - self.start_step) / (self.end_step - self.start_step)
+            current_ent = self.init_ent - progress * (self.init_ent - self.end_ent)
+        
+        # Inyectarlo directamente en el modelo
+        self.model.ent_coef = current_ent
+        
+        # Registrar en TensorBoard para poder ver la curva cayendo
+        self.logger.record("config/ent_coef", current_ent)
+        return True
+
 def _next_ppo_run_name() -> str:
     """Devuelve el nombre del próximo run (PPO_N) que SB3 va a crear en logs/."""
     existing = glob.glob(os.path.join(LOG_DIR, "PPO_*"))
@@ -171,7 +214,7 @@ def _next_ppo_run_name() -> str:
 
 
 
-def entrenar():
+def entrenar(resume_from=None):
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -221,21 +264,28 @@ def entrenar():
         ),
     )
 
-    model = PPO(
-        CONFIG["policy"],
-        env,
-        policy_kwargs=policy_kwargs,
-        verbose=0,
-        tensorboard_log=LOG_DIR,          # SB3 crea logs/PPO_N/
-        learning_rate=CONFIG["learning_rate"],
-        n_steps=CONFIG["n_steps"],
-        batch_size=CONFIG["batch_size"],
-        n_epochs=CONFIG["n_epochs"],
-        ent_coef=CONFIG["ent_coef"],
-        gamma=CONFIG["gamma"],
-        gae_lambda=CONFIG["gae_lambda"],
-        clip_range=CONFIG["clip_range"],
-    )
+    if resume_from is None:
+        model = PPO(
+            CONFIG["policy"],
+            env,
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+            tensorboard_log=LOG_DIR,
+            learning_rate=linear_schedule(CONFIG["learning_rate_init"], CONFIG["learning_rate_end"]), # <-- SCHEDULER LR
+            n_steps=CONFIG["n_steps"],
+            batch_size=CONFIG["batch_size"],
+            n_epochs=CONFIG["n_epochs"],
+            ent_coef=CONFIG["ent_coef_init"], # Arranca en el valor inicial
+            gamma=CONFIG["gamma"],
+            gae_lambda=CONFIG["gae_lambda"],
+            clip_range=CONFIG["clip_range"],
+        )
+        reset_num_timesteps = True
+    else:
+        model = PPO.load(resume_from, env=env)
+        model.tensorboard_log = LOG_DIR
+        reset_num_timesteps = False
+        logger.info(f"Reanudando entrenamiento desde {resume_from}…")
 
     # ── Callbacks ───────────────────────────────────────────────────────────
     eval_callback = EvalCallback(
@@ -256,15 +306,23 @@ def entrenar():
         verbose=1
     )
 
+    entropy_callback = DynamicEntCoefCallback(
+        init_ent=CONFIG["ent_coef_init"],
+        end_ent=CONFIG["ent_coef_end"],
+        start_step=CONFIG["ent_decay_start"],
+        end_step=CONFIG["ent_decay_end"]
+    )
+
     # ── Entrenar ────────────────────────────────────────────────────────────
     logger.info(f"Iniciando entrenamiento: {CONFIG['total_timesteps']:,} pasos…")
     t0 = time.time()
 
     model.learn(
         total_timesteps=CONFIG["total_timesteps"],
-        callback=[eval_callback, stats_callback, curriculum_callback],
-        tb_log_name="PPO",               # SB3 crea logs/PPO_N (N = run_name)
+        callback=[eval_callback, stats_callback, curriculum_callback, entropy_callback],
+        tb_log_name="PPO",
         progress_bar=True,
+        reset_num_timesteps=reset_num_timesteps,
     )
 
     elapsed = time.time() - t0
@@ -305,5 +363,7 @@ def probar_agente(model_path, n_episodios: int = 3):
 
 
 if __name__ == "__main__":
-    modelo, path = entrenar()
+    # resume_from = None
+    resume_from = "models/PPO/PPO_30/final_model.zip"
+    modelo, path = entrenar(resume_from=resume_from)
     probar_agente(path)

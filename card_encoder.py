@@ -85,8 +85,15 @@ class EscobaFeaturesExtractor(BaseFeaturesExtractor):
             torch.tensor(_GLOBALS_MAX[:n_globals], dtype=torch.float32),
         )
 
-        # ── MLP de salida ───────────────────────────────────────────────────
-        combined_dim = hidden_dim + hidden_dim + globals_hidden
+        # ── NUEVO: MLP para procesar la memoria de cartas jugadas ───────────
+        self.played_mlp = nn.Sequential(
+            nn.Linear(NUM_CARDS, 16),
+            nn.ReLU(),
+        )
+
+        # ── MLP de salida (Actualizar el combined_dim) ──────────────────────
+        # Sumamos los 16 del nuevo played_mlp
+        combined_dim = hidden_dim + hidden_dim + globals_hidden + 16
         self.output_mlp = nn.Sequential(
             nn.Linear(combined_dim, features_dim),
             nn.ReLU(),
@@ -140,6 +147,10 @@ class EscobaFeaturesExtractor(BaseFeaturesExtractor):
         globals_norm   = globals_f / self.globals_max.clamp(min=1.0)
         globals_latent = self.global_mlp(globals_norm)
 
-        # Concatenar y proyectar
-        combined = torch.cat([hand_latent, table_latent, globals_latent], dim=-1)
+        # --- NUEVO: Procesar la memoria de cartas ---
+        played_f = observations["played_cards"].float()
+        played_latent = self.played_mlp(played_f)
+
+        # Concatenar todo (Mano + Mesa + Globales + Memoria)
+        combined = torch.cat([hand_latent, table_latent, globals_latent, played_latent], dim=-1)
         return self.output_mlp(combined)
