@@ -451,9 +451,20 @@ def compute_opponent_action(model, env):
     return action
 
 
+def resolve_model_path(path: str) -> str:
+    if os.path.exists(path):
+        return path
+    if not path.endswith(".zip") and os.path.exists(path + ".zip"):
+        return path + ".zip"
+    raise FileNotFoundError(path)
+
+
 def main():
-    if not os.path.exists(MODEL_PATH + ".zip") and not os.path.exists(MODEL_PATH):
-        print(f"Model not found at {MODEL_PATH}")
+    model_path = sys.argv[1] if len(sys.argv) > 1 else MODEL_PATH
+    try:
+        model_path = resolve_model_path(model_path)
+    except FileNotFoundError:
+        print(f"Model not found at {model_path}")
         sys.exit(1)
 
     pygame.init()
@@ -466,7 +477,7 @@ def main():
     small_font = pygame.font.SysFont("arial", 16)
     big_font = pygame.font.SysFont("arial", 28, bold=True)
 
-    model = PPO.load(MODEL_PATH)
+    model = PPO.load(model_path)
     env = EscobaEnv(render_mode=None)
 
     current_seed = np.random.randint(0, 1_000_000)

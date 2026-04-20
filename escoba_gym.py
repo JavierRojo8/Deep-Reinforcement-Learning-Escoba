@@ -91,13 +91,17 @@ class EscobaEnv(gym.Env):
         self.render_mode = render_mode
 
         # ── NUEVO: tipo de oponente ──────────────────────────────────────────
-        # opponent_type: "random" | "greedy" | "model"
+        # opponent_type: "random" | "greedy" | "model" | "mixed"
         # opponent_model: instancia de PPO (u otro) cargada externamente,
         #                 solo se usa cuando opponent_type == "model"
-        if opponent_type not in ("random", "greedy", "model"):
-            raise ValueError(f"opponent_type debe ser 'random', 'greedy' o 'model', no '{opponent_type}'")
+        if opponent_type not in ("random", "greedy", "model", "mixed"):
+            raise ValueError(
+                f"opponent_type debe ser 'random', 'greedy', 'model' o 'mixed', no '{opponent_type}'"
+            )
         self.opponent_type  = opponent_type
         self.opponent_model = opponent_model
+        self._boss_deterministic = bool(boss_deterministic)
+        self.prob_greedy = 0.0
             
 
     
@@ -425,6 +429,8 @@ class EscobaEnv(gym.Env):
             return self._turno_oponente_random()
         elif self.opponent_type == "greedy":
             return self._turno_oponente_greedy()
+        elif self.opponent_type == "model":
+            return self._turno_oponente_model()
         elif self.opponent_type == "mixed":
             return self._turno_oponente_mezclado()
         return 0.0
@@ -550,17 +556,6 @@ class EscobaEnv(gym.Env):
 
         return min(indices_mano, key=prioridad)
 
-    def _elegir_carta_a_tirar(self, indices_mano):
-        """
-        Cuando no hay captura posible, elige la carta menos valiosa para dejar
-        en mesa: evita oros y sietes; entre el resto, prefiere valor bajo.
-        """
-        def prioridad(idx):
-            n, oro, v = self._obtener_info_carta(idx)
-            return oro * 100 + int(n == 7) * 50 + v  # menor → mejor para tirar
-
-        return min(indices_mano, key=prioridad)
-
     # ── Helper: observación desde la perspectiva del oponente ───────────────
     def _get_obs_opponent(self):
         """
@@ -601,18 +596,26 @@ class EscobaEnv(gym.Env):
             suma_mesa,                          # 12
         ], dtype=np.int16)
 
-        return {"hand": obs_hand, "table": obs_table, "globales": obs_globales}
+        obs_played = np.zeros(NUM_CARTAS, dtype=np.int8)
+        capturadas = (self.posicion_cartas == POS_MIS_BAZAS) | (self.posicion_cartas == POS_OP_BAZAS)
+        obs_played[capturadas] = 1
+
+        return {
+            "hand": obs_hand,
+            "table": obs_table,
+            "globales": obs_globales,
+            "played_cards": obs_played,
+        }
 
     # ── Estrategia 3: MODEL ──────────────────────────────────────────────────
     def _turno_oponente_model(self):
         """Usa self.opponent_model para decidir la jugada del oponente."""
         if self.opponent_model is None:
-            self._turno_oponente_random()
-            return
+            return self._turno_oponente_random()
 
         indices_mano_op = np.where(self.posicion_cartas == POS_MANO_OP)[0]
         if len(indices_mano_op) == 0:
-            return
+            return 0.0
 
         obs_op = self._get_obs_opponent()
         action, _ = self.opponent_model.predict(obs_op, deterministic=self._boss_deterministic)
@@ -626,9 +629,10 @@ class EscobaEnv(gym.Env):
         combo = self._buscar_mejor_jugada(valor_c, indices_mesa)
 
         if combo is not None:
-            self._ejecutar_captura_oponente(carta_idx, combo)
+            return self._ejecutar_captura_oponente(carta_idx, combo)
         else:
             self.posicion_cartas[carta_idx] = POS_MESA
+            return 0.0
 
     def _repartir_nueva_ronda(self):
         """

@@ -16,10 +16,11 @@ from stable_baselines3.common.utils import set_random_seed
 from escoba_gym import EscobaEnv
 from card_encoder import EscobaFeaturesExtractor
 
-# ââ ConfiguraciÃ³n centralizada ââââââââââââââââââââââââââââââââââââââââââââââ
 CONFIG = {
     "total_timesteps":  800_000_000,
     "opponent_type":    "mixed",          # Ahora usamos el oponente mixto
+    "opponent_model_path": None,          # usar cuando opponent_type == "model"
+    "opponent_model_deterministic": True,
     "curriculum_schedule": [
         # (Paso de entrenamiento, Probabilidad de ser Greedy)
         (0,          0.0),   # 0 a 20M:   100% Random
@@ -38,27 +39,25 @@ CONFIG = {
     "clip_range":       0.2,
     "eval_freq":        200_000,
     "n_eval_episodes":  20,
-    # ââ Encoder de cartas (EscobaFeaturesExtractor) ââââââââââââââââââââââââââ
-    "embed_dim":        16,   # dimensiÃ³n del embedding por carta
-    "hidden_dim":       32,   # dimensiÃ³n de la MLP por carta
-    "features_dim":     32,   # dimensiÃ³n del vector latente final
-    "num_envs":         64,    # nÃºmero de entornos paralelos para entrenamiento (SubprocVecEnv)
-    # ââ HiperparÃ¡metros DinÃ¡micos (Schedulers) âââââââââââââââââââââââââ
+    "embed_dim":        16,   # dimensión del embedding por carta
+    "hidden_dim":       32,   # dimensión de la MLP por carta
+    "features_dim":     32,   # dimensión del vector latente final
+    "num_envs":         64,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
     "learning_rate_init": 1e-4,
-    "learning_rate_end":  1e-4,   # BajarÃ¡ poco a poco hasta casi cero
+    "learning_rate_end":  1e-4,   # Bajará poco a poco hasta casi cero
     
     "ent_coef_init":      0.008,
-    "ent_coef_end":       0.008,  # Al final, jugarÃ¡ casi 100% de memoria, sin azar
+    "ent_coef_end":       0.008,  # Al final, jugará casi 100% de memoria, sin azar
     "ent_decay_start":    80_000_000,   # Empieza a bajar cuando el rival es 60% greedy
     "ent_decay_end":      220_000_000,  # Termina de bajar casi al final
 }
 
-LOG_DIR    = "logs"       # TensorBoard logs  â  logs/PPO_N/
-MODELS_DIR = "models/PPO" # Modelos guardados â  models/PPO/PPO_N/
+LOG_DIR    = "logs"       # TensorBoard logs    logs/PPO_N/
+MODELS_DIR = "models/PPO" # Modelos guardados   models/PPO/PPO_N/
 
 def linear_schedule(initial_value: float, final_value: float = 0.0):
     """
-    Devuelve una funciÃ³n que calcula un valor linealmente decreciente,
+    Devuelve una función que calcula un valor linealmente decreciente,
     ideal para el learning_rate en Stable-Baselines3.
     """
     def func(progress_remaining: float) -> float:
@@ -66,33 +65,51 @@ def linear_schedule(initial_value: float, final_value: float = 0.0):
         return progress_remaining * (initial_value - final_value) + final_value
     return func
 
-def make_env(env_id, opponent_type, seed=0):
+def _resolve_model_path(path: str) -> str:
+    if os.path.exists(path):
+        return path
+    if not path.endswith(".zip") and os.path.exists(path + ".zip"):
+        return path + ".zip"
+    raise FileNotFoundError(f"No se encontró el modelo del oponente en: {path}")
+
+
+def make_env(env_id, opponent_type, seed=0, opponent_model_path=None, opponent_model_deterministic=True):
     """
-    FunciÃ³n de utilidad para crear instancias independientes del entorno en diferentes procesos.
+    Función de utilidad para crear instancias independientes del entorno en diferentes procesos.
     """
     def _init():
-        env = EscobaEnv(render_mode=None, opponent_type=opponent_type)
+        opponent_model = None
+        if opponent_type == "model":
+            if not opponent_model_path:
+                raise ValueError("opponent_type='model' requiere CONFIG['opponent_model_path']")
+            opponent_model = PPO.load(_resolve_model_path(opponent_model_path))
+
+        env = EscobaEnv(
+            render_mode=None,
+            opponent_type=opponent_type,
+            opponent_model=opponent_model,
+            boss_deterministic=opponent_model_deterministic,
+        )
         env.reset(seed=seed + env_id)
         return env
     return _init
 
 
-# ââ Callback de mÃ©tricas de juego âââââââââââââââââââââââââââââââââââââââââââ
 class EscobaStatsCallback(BaseCallback):
     """
-    Acumula estadÃ­sticas de juego por rollout y las vuelca a TensorBoard.
+    Acumula estadísticas de juego por rollout y las vuelca a TensorBoard.
 
     MÃ©tricas registradas (prefijo 'escoba/'):
-      win_rate    â fracciÃ³n de episodios ganados
-      draw_rate   â fracciÃ³n de empates
-      loss_rate   â fracciÃ³n de episodios perdidos
+      win_rate    â fracción de episodios ganados
+      draw_rate   â fracción de empates
+      loss_rate   â fracción de episodios perdidos
       point_diff  â diferencia media de puntos (jugador â oponente)
       points_tu   â puntos medios del jugador
       points_op   â puntos medios del oponente
       escobas_tu  â escobas medias por episodio (jugador)
       escobas_op  â escobas medias por episodio (oponente)
-      cards_rate  â fracciÃ³n de las 40 cartas capturadas por el jugador
-      7oro_rate   â fracciÃ³n de episodios en que se captura el 7 de oros
+      cards_rate  â fracción de las 40 cartas capturadas por el jugador
+      7oro_rate   â fracción de episodios en que se captura el 7 de oros
     """
 
     def __init__(self, verbose: int = 0):
@@ -173,7 +190,7 @@ class CurriculumCallback(BaseCallback):
 
 class DynamicEntCoefCallback(BaseCallback):
     """
-    Baja el coeficiente de entropÃ­a linealmente a medida que avanza el entrenamiento.
+    Baja el coeficiente de entropía linealmente a medida que avanza el entrenamiento.
     """
     def __init__(self, init_ent, end_ent, start_step, end_step, verbose=0):
         super().__init__(verbose)
@@ -200,7 +217,7 @@ class DynamicEntCoefCallback(BaseCallback):
         return True
 
 def _next_ppo_run_name() -> str:
-    """Devuelve el nombre del prÃ³ximo run (PPO_N) que SB3 va a crear en logs/."""
+    """Devuelve el nombre del próximo run (PPO_N) que SB3 va a crear en logs/."""
     existing = glob.glob(os.path.join(LOG_DIR, "PPO_*"))
     nums = []
     for d in existing:
@@ -219,7 +236,7 @@ def entrenar(resume_from=None):
     os.makedirs(MODELS_DIR, exist_ok=True)
 
     # ââ Determinar nombre del run antes de entrenar âââââââââââââââââââââââââ
-    # SB3 crearÃ¡ logs/PPO_N automÃ¡ticamente; calculamos N de antemano
+    # SB3 creará logs/PPO_N automáticamente; calculamos N de antemano
     # para poder nombrar el directorio de modelos igual.
     run_name   = _next_ppo_run_name()               # e.g. "PPO_9"
     model_dir  = os.path.join(MODELS_DIR, run_name) # models/PPO/PPO_9/
@@ -243,10 +260,25 @@ def entrenar(resume_from=None):
 
     # ââ Entornos Paralelizados ââââââââââââââââââââââââââââââââââââââââââââââ
     opp = CONFIG["opponent_type"]
+    opp_model_path = CONFIG.get("opponent_model_path")
+    opp_model_deterministic = bool(CONFIG.get("opponent_model_deterministic", True))
+    if opp == "model":
+        if not opp_model_path:
+            raise ValueError("CONFIG['opponent_model_path'] es obligatorio cuando opponent_type='model'")
+        opp_model_path = _resolve_model_path(opp_model_path)
+
     num_envs = CONFIG["num_envs"]
     
     # Entorno de entrenamiento paralelizado (arranca en "mixed")
-    env = SubprocVecEnv([make_env(i, opp) for i in range(num_envs)])
+    env = SubprocVecEnv([
+        make_env(
+            i,
+            opp,
+            opponent_model_path=opp_model_path,
+            opponent_model_deterministic=opp_model_deterministic,
+        )
+        for i in range(num_envs)
+    ])
     env = VecMonitor(env, os.path.join(model_dir, "train_monitor"))
 
     # IMPORTANTE: El evaluador SIEMPRE juega contra 100% greedy para tener 
@@ -317,9 +349,13 @@ def entrenar(resume_from=None):
     logger.info(f"Iniciando entrenamiento: {CONFIG['total_timesteps']:,} pasosâ¦")
     t0 = time.time()
 
+    callbacks = [eval_callback, stats_callback, entropy_callback]
+    if opp == "mixed":
+        callbacks.append(curriculum_callback)
+
     model.learn(
         total_timesteps=CONFIG["total_timesteps"],
-        callback=[eval_callback, stats_callback, curriculum_callback, entropy_callback],
+        callback=callbacks,
         tb_log_name="PPO",
         progress_bar=True,
         reset_num_timesteps=reset_num_timesteps,
