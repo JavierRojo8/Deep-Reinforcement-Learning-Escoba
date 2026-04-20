@@ -1,0 +1,18 @@
+{
+  "total_timesteps": 40000,
+  "policy": "MultiInputPolicy",
+  "learning_rate": 0.0003,
+  "n_steps": 256,
+  "batch_size": 256,
+  "n_epochs": 10,
+  "ent_coef": 0.01,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "eval_freq": 5000,
+  "n_eval_episodes": 20,
+  "run_name": "PPO_9",
+  "started_at": "2026-04-13T17:40:17.174220",
+  "finished_at": "2026-04-13T17:40:54.213076",
+  "elapsed_min": 0.59
+}

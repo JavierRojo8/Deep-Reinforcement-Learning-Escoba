@@ -1,0 +1,6 @@
+2026-04-13 11:46:10  INFO      Run iniciado: escoba_v1_20260413_114610
+2026-04-13 11:46:10  INFO      Directorio  : runs\escoba_v1_20260413_114610
+2026-04-13 11:46:10  INFO      Config guardada en runs\escoba_v1_20260413_114610\config.json
+2026-04-13 11:46:10  INFO      Verificando entorno…
+2026-04-13 11:46:10  INFO      Entorno verificado.
+2026-04-13 11:46:10  INFO      Iniciando entrenamiento: 4,000,000 pasos…

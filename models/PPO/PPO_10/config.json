@@ -1,0 +1,17 @@
+{
+  "total_timesteps": 4000000,
+  "opponent_type": "greedy",
+  "policy": "MultiInputPolicy",
+  "learning_rate": 0.0003,
+  "n_steps": 256,
+  "batch_size": 256,
+  "n_epochs": 10,
+  "ent_coef": 0.01,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "eval_freq": 5000,
+  "n_eval_episodes": 20,
+  "run_name": "PPO_10",
+  "started_at": "2026-04-13T18:02:53.954212"
+}
