@@ -44,10 +44,10 @@ CONFIG = {
     "features_dim":     32,   # dimensión del vector latente final
     "num_envs":         64,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
     # ── Hiperparámetros Dinámicos (Schedulers) ─────────────────────────
-    "learning_rate_init": 5e-4,
+    "learning_rate_init": 1e-4,
     "learning_rate_end":  1e-4,   # Bajará poco a poco hasta casi cero
     
-    "ent_coef_init":      0.04,
+    "ent_coef_init":      0.008,
     "ent_coef_end":       0.008,  # Al final, jugará casi 100% de memoria, sin azar
     "ent_decay_start":    80_000_000,   # Empieza a bajar cuando el rival es 60% greedy
     "ent_decay_end":      220_000_000,  # Termina de bajar casi al final
@@ -364,6 +364,6 @@ def probar_agente(model_path, n_episodios: int = 3):
 
 if __name__ == "__main__":
     # resume_from = None
-    resume_from = "models/PPO/PPO_30/final_model.zip"
+    resume_from = "models/PPO/PPO_33/final_model.zip"
     modelo, path = entrenar(resume_from=resume_from)
     probar_agente(path)
