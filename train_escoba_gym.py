@@ -21,6 +21,10 @@ CONFIG = {
     "opponent_type":    "mixed",          # Ahora usamos el oponente mixto
     "opponent_model_path": None,          # usar cuando opponent_type == "model"
     "opponent_model_deterministic": True,
+    # "auto": usa SubprocVecEnv salvo cuando el rival es "model" (entonces usa DummyVecEnv para no duplicar el modelo en RAM).
+    # "subproc": fuerza SubprocVecEnv.
+    # "dummy": fuerza DummyVecEnv.
+    "train_vecenv": "auto",
     "curriculum_schedule": [
         # (Paso de entrenamiento, Probabilidad de ser Greedy)
         (0,          0.0),   # 0 a 20M:   100% Random
@@ -73,16 +77,24 @@ def _resolve_model_path(path: str) -> str:
     raise FileNotFoundError(f"No se encontró el modelo del oponente en: {path}")
 
 
-def make_env(env_id, opponent_type, seed=0, opponent_model_path=None, opponent_model_deterministic=True):
+def make_env(
+    env_id,
+    opponent_type,
+    seed=0,
+    opponent_model_path=None,
+    opponent_model_deterministic=True,
+    opponent_model_obj=None,
+):
     """
     Función de utilidad para crear instancias independientes del entorno en diferentes procesos.
     """
     def _init():
-        opponent_model = None
+        opponent_model = opponent_model_obj
         if opponent_type == "model":
-            if not opponent_model_path:
-                raise ValueError("opponent_type='model' requiere CONFIG['opponent_model_path']")
-            opponent_model = PPO.load(_resolve_model_path(opponent_model_path))
+            if opponent_model is None:
+                if not opponent_model_path:
+                    raise ValueError("opponent_type='model' requiere CONFIG['opponent_model_path']")
+                opponent_model = PPO.load(_resolve_model_path(opponent_model_path))
 
         env = EscobaEnv(
             render_mode=None,
@@ -262,23 +274,52 @@ def entrenar(resume_from=None):
     opp = CONFIG["opponent_type"]
     opp_model_path = CONFIG.get("opponent_model_path")
     opp_model_deterministic = bool(CONFIG.get("opponent_model_deterministic", True))
+    train_vecenv = CONFIG.get("train_vecenv", "auto")
     if opp == "model":
         if not opp_model_path:
             raise ValueError("CONFIG['opponent_model_path'] es obligatorio cuando opponent_type='model'")
         opp_model_path = _resolve_model_path(opp_model_path)
 
     num_envs = CONFIG["num_envs"]
-    
-    # Entorno de entrenamiento paralelizado (arranca en "mixed")
-    env = SubprocVecEnv([
-        make_env(
-            i,
-            opp,
-            opponent_model_path=opp_model_path,
-            opponent_model_deterministic=opp_model_deterministic,
-        )
-        for i in range(num_envs)
-    ])
+
+    # Evita duplicar el modelo rival en RAM: con rival "model", "auto" usa DummyVecEnv.
+    use_dummy = train_vecenv == "dummy" or (train_vecenv == "auto" and opp == "model")
+
+    if use_dummy:
+        shared_opponent_model = None
+        if opp == "model":
+            shared_opponent_model = PPO.load(opp_model_path)
+            logger.info(
+                "train_vecenv=DummyVecEnv (modelo rival compartido en un único proceso; evita copias por entorno)."
+            )
+        else:
+            logger.info("train_vecenv=DummyVecEnv.")
+
+        env = DummyVecEnv([
+            make_env(
+                i,
+                opp,
+                opponent_model_path=opp_model_path,
+                opponent_model_deterministic=opp_model_deterministic,
+                opponent_model_obj=shared_opponent_model,
+            )
+            for i in range(num_envs)
+        ])
+    else:
+        if opp == "model":
+            logger.warning(
+                "train_vecenv=SubprocVecEnv con opponent_type='model': "
+                "cada worker cargará su propia copia del rival (alto uso de RAM)."
+            )
+        env = SubprocVecEnv([
+            make_env(
+                i,
+                opp,
+                opponent_model_path=opp_model_path,
+                opponent_model_deterministic=opp_model_deterministic,
+            )
+            for i in range(num_envs)
+        ])
     env = VecMonitor(env, os.path.join(model_dir, "train_monitor"))
 
     # IMPORTANTE: El evaluador SIEMPRE juega contra 100% greedy para tener 
