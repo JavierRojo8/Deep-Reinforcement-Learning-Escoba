@@ -6,7 +6,7 @@ def load_monitor_csv(path):
     with open(path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    # Monitor CSV has first line as json metadata
+
     df = pd.read_csv(path, skiprows=1)
     return df
 
