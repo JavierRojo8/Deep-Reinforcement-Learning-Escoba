@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 
 import numpy as np
+import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
@@ -18,6 +19,10 @@ from card_encoder import EscobaFeaturesExtractor
 
 # ── Configuración centralizada ──────────────────────────────────────────────
 CONFIG = {
+    "bc_steps":         200_000,     # pasos de behavioral cloning antes de PPO
+    "bc_epochs":        5,           # épocas BC por lote
+    "bc_batch_size":    512,
+    "bc_lr":            3e-4,
     "total_timesteps":  400_000_000,
     "opponent_type":    "mixed",          # Ahora usamos el oponente mixto
     "curriculum_schedule": [
@@ -199,6 +204,79 @@ class DynamicEntCoefCallback(BaseCallback):
         self.logger.record("config/ent_coef", current_ent)
         return True
 
+def collect_bc_data(n_steps: int, seed: int = 42) -> dict:
+    """Run greedy vs greedy, record player observations and greedy actions."""
+    env = EscobaEnv(render_mode=None, opponent_type="greedy")
+    obs, _ = env.reset(seed=seed)
+
+    all_obs   = {k: [] for k in obs}
+    all_masks = []
+    all_acts  = []
+
+    collected = 0
+    while collected < n_steps:
+        action = env.greedy_player_action()
+        mask   = env.action_masks()
+        for k, v in obs.items():
+            all_obs[k].append(v.copy())
+        all_masks.append(mask.copy())
+        all_acts.append(action)
+        collected += 1
+        obs, _, terminated, truncated, _ = env.step(action)
+        if terminated or truncated:
+            obs, _ = env.reset()
+
+    return {
+        "obs":     {k: np.stack(v) for k, v in all_obs.items()},
+        "masks":   np.array(all_masks, dtype=bool),
+        "actions": np.array(all_acts,  dtype=np.int64),
+    }
+
+
+def pretrain_bc(model, n_steps: int, n_epochs: int = 5,
+                batch_size: int = 512, lr: float = 3e-4) -> None:
+    """Behavioural cloning warm-start: trains model.policy in-place."""
+    print(f"[BC] Collecting {n_steps:,} greedy demos…")
+    demos  = collect_bc_data(n_steps)
+    N      = len(demos["actions"])
+    device = model.policy.device
+
+    obs_tensors = {
+        k: torch.tensor(v, dtype=torch.float32 if v.dtype != np.int64 else torch.long, device=device)
+        for k, v in demos["obs"].items()
+    }
+    masks_t   = torch.tensor(demos["masks"],   dtype=torch.bool,  device=device)
+    actions_t = torch.tensor(demos["actions"], dtype=torch.long,  device=device)
+
+    optimizer = torch.optim.Adam(model.policy.parameters(), lr=lr)
+
+    print(f"[BC] Training {n_epochs} epoch(s) on {N:,} transitions…")
+    for epoch in range(n_epochs):
+        perm        = np.random.permutation(N)
+        total_loss  = 0.0
+        n_batches   = 0
+        for start in range(0, N, batch_size):
+            idx = perm[start : start + batch_size]
+            obs_b  = {k: v[idx] for k, v in obs_tensors.items()}
+            mask_b = masks_t[idx]
+            act_b  = actions_t[idx]
+
+            _, log_prob, _ = model.policy.evaluate_actions(
+                obs_b, act_b, action_masks=mask_b
+            )
+            loss = -log_prob.mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches  += 1
+
+        print(f"[BC] Epoch {epoch + 1}/{n_epochs}  loss={total_loss / n_batches:.4f}")
+
+    print("[BC] Pretraining done.")
+
+
 def _next_ppo_run_name() -> str:
     """Devuelve el nombre del próximo run (PPO_N) que SB3 va a crear en logs/."""
     existing = glob.glob(os.path.join(LOG_DIR, "PPO_*"))
@@ -282,6 +360,14 @@ def entrenar(resume_from=None):
             gae_lambda=CONFIG["gae_lambda"],
             clip_range=CONFIG["clip_range"],
         )
+        if CONFIG["bc_steps"] > 0:
+            pretrain_bc(
+                model,
+                n_steps=CONFIG["bc_steps"],
+                n_epochs=CONFIG["bc_epochs"],
+                batch_size=CONFIG["bc_batch_size"],
+                lr=CONFIG["bc_lr"],
+            )
         reset_num_timesteps = True
     else:
         model = MaskablePPO.load(resume_from, env=env)

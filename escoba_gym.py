@@ -300,6 +300,33 @@ class EscobaEnv(gym.Env):
         mask[:n_cards] = True
         return mask
 
+    def greedy_player_action(self):
+        """Return action index (0-2) that greedy strategy would choose for the player."""
+        indices_mano_raw = np.where(self.posicion_cartas == POS_MI_MANO)[0]
+        if len(indices_mano_raw) == 0:
+            return 0
+        indices_mano = sorted(indices_mano_raw, key=self._clave_orden_carta)
+        indices_mesa = np.where(self.posicion_cartas == POS_MESA)[0]
+
+        mejor_score = -1
+        mejor_slot = -1
+
+        for slot, carta_idx in enumerate(indices_mano):
+            _, _, valor_c = self._obtener_info_carta(carta_idx)
+            combo = self._buscar_mejor_jugada(valor_c, indices_mesa)
+            if combo is None:
+                continue
+            score = self._puntuar_jugada_greedy(carta_idx, combo, indices_mesa)
+            if score > mejor_score:
+                mejor_score = score
+                mejor_slot = slot
+
+        if mejor_slot == -1:
+            carta_a_tirar = self._elegir_carta_a_tirar(indices_mano)
+            mejor_slot = indices_mano.index(carta_a_tirar)
+
+        return mejor_slot
+
     def set_opponent(self, opponent_type):
         """Permite cambiar el tipo de oponente a mitad del entrenamiento."""
         if opponent_type in ("random", "greedy", "model", "mixed"):
