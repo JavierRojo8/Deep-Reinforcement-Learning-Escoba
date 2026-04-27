@@ -6,10 +6,10 @@ import time
 from datetime import datetime
 
 import numpy as np
-from stable_baselines3 import PPO
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
-
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
 from stable_baselines3.common.utils import set_random_seed
 
@@ -22,12 +22,11 @@ CONFIG = {
     "opponent_type":    "mixed",          # Ahora usamos el oponente mixto
     "curriculum_schedule": [
         # (Paso de entrenamiento, Probabilidad de ser Greedy)
-        (0,          0.0),   # 0 a 20M:   100% Random
-        (40_000_000, 0.2),   # 20M a 40M: 20% Greedy
-        (60_000_000, 0.4),   # 40M a 60M: 40% Greedy
-        (80_000_000, 0.6),   # 60M a 80M: 60% Greedy
-        (120_000_000, 0.8),   # 80M a 100M: 80% Greedy
-        (160_000_000, 1.0),   # 100M+:      100% Greedy
+        (0,           0.2),   # 0M:  20% Greedy desde el inicio
+        (10_000_000,  0.4),   # 10M: 40% Greedy
+        (20_000_000,  0.6),   # 20M: 60% Greedy
+        (35_000_000,  0.8),   # 35M: 80% Greedy
+        (50_000_000,  1.0),   # 50M+: 100% Greedy
     ],
     "policy":           "MultiInputPolicy",
     "n_steps":          1024,
@@ -40,17 +39,17 @@ CONFIG = {
     "n_eval_episodes":  20,
     # ── Encoder de cartas (EscobaFeaturesExtractor) ──────────────────────────
     "embed_dim":        16,   # dimensión del embedding por carta
-    "hidden_dim":       32,   # dimensión de la MLP por carta
-    "features_dim":     32,   # dimensión del vector latente final
+    "hidden_dim":       64,   # dimensión de la MLP por carta
+    "features_dim":     64,   # dimensión del vector latente final
     "num_envs":         64,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
     # ── Hiperparámetros Dinámicos (Schedulers) ─────────────────────────
     "learning_rate_init": 1e-4,
-    "learning_rate_end":  1e-4,   # Bajará poco a poco hasta casi cero
-    
-    "ent_coef_init":      0.008,
-    "ent_coef_end":       0.008,  # Al final, jugará casi 100% de memoria, sin azar
-    "ent_decay_start":    80_000_000,   # Empieza a bajar cuando el rival es 60% greedy
-    "ent_decay_end":      220_000_000,  # Termina de bajar casi al final
+    "learning_rate_end":  1e-4,
+
+    "ent_coef_init":      0.01,
+    "ent_coef_end":       0.002,  # Decae a exploración mínima al final
+    "ent_decay_start":    20_000_000,   # Empieza cuando rival es ~60% greedy
+    "ent_decay_end":      150_000_000,  # Termina de bajar
 }
 
 LOG_DIR    = "logs"       # TensorBoard logs  →  logs/PPO_N/
@@ -66,13 +65,14 @@ def linear_schedule(initial_value: float, final_value: float = 0.0):
         return progress_remaining * (initial_value - final_value) + final_value
     return func
 
+def _mask_fn(env):
+    return env.action_masks()
+
 def make_env(env_id, opponent_type, seed=0):
-    """
-    Función de utilidad para crear instancias independientes del entorno en diferentes procesos.
-    """
     def _init():
         env = EscobaEnv(render_mode=None, opponent_type=opponent_type)
         env.reset(seed=seed + env_id)
+        env = ActionMasker(env, _mask_fn)
         return env
     return _init
 
@@ -245,12 +245,14 @@ def entrenar(resume_from=None):
     opp = CONFIG["opponent_type"]
     num_envs = CONFIG["num_envs"]
     
-    # Entorno de entrenamiento paralelizado (arranca en "mixed")
     env = SubprocVecEnv([make_env(i, opp) for i in range(num_envs)])
     env = VecMonitor(env, os.path.join(model_dir, "train_monitor"))
 
-    # IMPORTANTE: El evaluador SIEMPRE juega contra 100% greedy para tener 
-    # una métrica de rendimiento "real" que no dependa de la fase curricular.
+    # Aplicar prob_greedy inicial del curriculum (la callback solo actualiza en cambios de fase)
+    initial_prob = CONFIG["curriculum_schedule"][0][1]
+    env.env_method("set_prob_greedy", initial_prob)
+
+    # El evaluador SIEMPRE juega contra 100% greedy
     eval_env = DummyVecEnv([make_env(99, "greedy")])
     eval_env = VecMonitor(eval_env, os.path.join(model_dir, "eval_monitor"))
 
@@ -265,33 +267,33 @@ def entrenar(resume_from=None):
     )
 
     if resume_from is None:
-        model = PPO(
+        model = MaskablePPO(
             CONFIG["policy"],
             env,
             policy_kwargs=policy_kwargs,
             verbose=0,
             tensorboard_log=LOG_DIR,
-            learning_rate=linear_schedule(CONFIG["learning_rate_init"], CONFIG["learning_rate_end"]), # <-- SCHEDULER LR
+            learning_rate=linear_schedule(CONFIG["learning_rate_init"], CONFIG["learning_rate_end"]),
             n_steps=CONFIG["n_steps"],
             batch_size=CONFIG["batch_size"],
             n_epochs=CONFIG["n_epochs"],
-            ent_coef=CONFIG["ent_coef_init"], # Arranca en el valor inicial
+            ent_coef=CONFIG["ent_coef_init"],
             gamma=CONFIG["gamma"],
             gae_lambda=CONFIG["gae_lambda"],
             clip_range=CONFIG["clip_range"],
         )
         reset_num_timesteps = True
     else:
-        model = PPO.load(resume_from, env=env)
+        model = MaskablePPO.load(resume_from, env=env)
         model.tensorboard_log = LOG_DIR
         reset_num_timesteps = False
         logger.info(f"Reanudando entrenamiento desde {resume_from}…")
 
     # ── Callbacks ───────────────────────────────────────────────────────────
-    eval_callback = EvalCallback(
+    eval_callback = MaskableEvalCallback(
         eval_env,
-        best_model_save_path=model_dir,   # → models/PPO/PPO_N/best_model.zip
-        log_path=model_dir,               # → models/PPO/PPO_N/evaluations.npz
+        best_model_save_path=model_dir,
+        log_path=model_dir,
         eval_freq=CONFIG["eval_freq"],
         n_eval_episodes=CONFIG["n_eval_episodes"],
         deterministic=True,
@@ -347,7 +349,7 @@ def entrenar(resume_from=None):
 
 def probar_agente(model_path, n_episodios: int = 3):
     env   = EscobaEnv(render_mode="human")
-    model = PPO.load(model_path)
+    model = MaskablePPO.load(model_path)
 
     for ep in range(n_episodios):
         obs, _ = env.reset()

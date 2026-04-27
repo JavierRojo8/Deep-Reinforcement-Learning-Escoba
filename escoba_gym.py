@@ -293,6 +293,13 @@ class EscobaEnv(gym.Env):
         info = self._get_info()
         return observation, reward, terminated, truncated, info
     
+    def action_masks(self):
+        """Return boolean mask of valid actions (for MaskablePPO)."""
+        n_cards = int(np.count_nonzero(self.posicion_cartas == POS_MI_MANO))
+        mask = np.zeros(3, dtype=bool)
+        mask[:n_cards] = True
+        return mask
+
     def set_opponent(self, opponent_type):
         """Permite cambiar el tipo de oponente a mitad del entrenamiento."""
         if opponent_type in ("random", "greedy", "model", "mixed"):

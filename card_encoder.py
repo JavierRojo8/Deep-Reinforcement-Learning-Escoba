@@ -58,7 +58,7 @@ class EscobaFeaturesExtractor(BaseFeaturesExtractor):
 
         
         n_globals = observation_space["globales"].shape[0]
-        globals_hidden = 16
+        globals_hidden = hidden_dim // 2
         self.global_mlp = nn.Sequential(
             nn.Linear(n_globals, globals_hidden),
             nn.ReLU(),
@@ -69,15 +69,14 @@ class EscobaFeaturesExtractor(BaseFeaturesExtractor):
             torch.tensor(_GLOBALS_MAX[:n_globals], dtype=torch.float32),
         )
 
-        
+        played_hidden = hidden_dim // 2
         self.played_mlp = nn.Sequential(
-            nn.Linear(NUM_CARDS, 16),
+            nn.Linear(NUM_CARDS, played_hidden),
             nn.ReLU(),
         )
 
         
-        
-        combined_dim = hidden_dim + hidden_dim + globals_hidden + 16
+        combined_dim = hidden_dim + hidden_dim + globals_hidden + played_hidden
         self.output_mlp = nn.Sequential(
             nn.Linear(combined_dim, features_dim),
             nn.ReLU(),
