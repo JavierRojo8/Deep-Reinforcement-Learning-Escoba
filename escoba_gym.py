@@ -69,7 +69,7 @@ class EscobaEnv(gym.Env):
             )
         })
 
-        self.action_space = spaces.Discrete(64)  # index into _enumerate_valid_plays()
+        self.action_space = spaces.Discrete(256)  # index into _enumerate_valid_plays()
 
         self._estado_juego = None
         self._episode_result = None
@@ -247,7 +247,7 @@ class EscobaEnv(gym.Env):
         table_bitmask: bitmask over sorted table cards; 0 means discard to table.
         Rule: if a card can capture, only capture actions listed (must capture).
               if a card cannot capture, one discard action listed.
-        Max length: 64 (verified empirically).
+        Max length: ≤256 (empirical max observed ~125).
         """
         indices_mano = sorted(np.where(self.posicion_cartas == POS_MI_MANO)[0],
                               key=self._clave_orden_carta)
@@ -324,9 +324,9 @@ class EscobaEnv(gym.Env):
         return self._get_obs(), reward, terminated, truncated, self._get_info()
     
     def action_masks(self):
-        """Return 64-bool mask: True at each valid play index."""
+        """Return 256-bool mask: True at each valid play index."""
         plays = self._enumerate_valid_plays()
-        mask = np.zeros(64, dtype=bool)
+        mask = np.zeros(256, dtype=bool)
         mask[:len(plays)] = True
         return mask
 
