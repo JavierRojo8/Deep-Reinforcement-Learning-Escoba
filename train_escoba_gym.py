@@ -19,8 +19,8 @@ from card_encoder import EscobaFeaturesExtractor
 
 # ── Configuración centralizada ──────────────────────────────────────────────
 CONFIG = {
-    "bc_steps":         200_000,     # pasos de behavioral cloning antes de PPO
-    "bc_epochs":        5,           # épocas BC por lote
+    "bc_steps":         300_000,     # pasos de behavioral cloning antes de PPO
+    "bc_epochs":        20,           # épocas BC por lote
     "bc_batch_size":    512,
     "bc_lr":            3e-4,
     "total_timesteps":  400_000_000,
@@ -40,19 +40,19 @@ CONFIG = {
     "gamma":            0.99,
     "gae_lambda":       0.95,
     "clip_range":       0.2,
-    "eval_freq":        5_000,
+    "eval_freq":        50_000,
     "n_eval_episodes":  20,
     # ── Encoder de cartas (EscobaFeaturesExtractor) ──────────────────────────
     "embed_dim":        16,   # dimensión del embedding por carta
     "hidden_dim":       64,   # dimensión de la MLP por carta
     "features_dim":     64,   # dimensión del vector latente final
-    "num_envs":         64,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
+    "num_envs":         10,    # número de entornos paralelos para entrenamiento (SubprocVecEnv)
     # ── Hiperparámetros Dinámicos (Schedulers) ─────────────────────────
-    "learning_rate_init": 1e-4,
+    "learning_rate_init": 4e-4,
     "learning_rate_end":  1e-4,
 
-    "ent_coef_init":      0.01,
-    "ent_coef_end":       0.002,  # Decae a exploración mínima al final
+    "ent_coef_init":      0.03,
+    "ent_coef_end":       0.008,  # Decae a exploración mínima al final
     "ent_decay_start":    20_000_000,   # Empieza cuando rival es ~60% greedy
     "ent_decay_end":      150_000_000,  # Termina de bajar
 }
@@ -451,7 +451,7 @@ def probar_agente(model_path, n_episodios: int = 3):
 
 
 if __name__ == "__main__":
-    # resume_from = None
-    resume_from = "models/PPO/PPO_33/final_model.zip"
+    resume_from = None
+    # resume_from = "models/PPO/PPO_33/final_model.zip"
     modelo, path = entrenar(resume_from=resume_from)
     probar_agente(path)

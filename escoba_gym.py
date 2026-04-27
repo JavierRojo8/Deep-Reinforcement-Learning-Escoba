@@ -69,7 +69,7 @@ class EscobaEnv(gym.Env):
             )
         })
 
-        self.action_space = spaces.Discrete(3) 
+        self.action_space = spaces.Discrete(64)  # index into _enumerate_valid_plays()
 
         self._estado_juego = None
         self._episode_result = None
@@ -240,31 +240,63 @@ class EscobaEnv(gym.Env):
                     mejor_combo = tuple(combo_actual)
         return mejor_combo
 
+    def _enumerate_valid_plays(self):
+        """
+        Returns list of (hand_slot, table_bitmask) for all valid plays.
+        hand_slot: 0-2, index into sorted hand.
+        table_bitmask: bitmask over sorted table cards; 0 means discard to table.
+        Rule: if a card can capture, only capture actions listed (must capture).
+              if a card cannot capture, one discard action listed.
+        Max length: 64 (verified empirically).
+        """
+        indices_mano = sorted(np.where(self.posicion_cartas == POS_MI_MANO)[0],
+                              key=self._clave_orden_carta)
+        indices_mesa = sorted(np.where(self.posicion_cartas == POS_MESA)[0],
+                              key=self._clave_orden_carta)
+        n_mesa = len(indices_mesa)
+        plays = []
+        for slot, carta_idx in enumerate(indices_mano):
+            _, _, valor_c = self._obtener_info_carta(carta_idx)
+            target = 15 - valor_c
+            card_has_capture = False
+            if n_mesa > 0 and target >= 0:
+                for mask in range(1, 1 << n_mesa):
+                    s = 0
+                    for i in range(n_mesa):
+                        if mask & (1 << i):
+                            s += _VALORES_JUEGO[indices_mesa[i]]
+                    if s == target:
+                        plays.append((slot, mask))
+                        card_has_capture = True
+            if not card_has_capture:
+                plays.append((slot, 0))
+        return plays
+
     def step(self, action):
         """Realiza una acción y avanza el entorno una jugada."""
+        plays = self._enumerate_valid_plays()
+        if not plays:
+            return self._get_obs(), 0, True, False, {}
+
+        action_idx = min(int(action), len(plays) - 1)
+        hand_slot, table_bitmask = plays[action_idx]
+
+        indices_mano = sorted(np.where(self.posicion_cartas == POS_MI_MANO)[0],
+                              key=self._clave_orden_carta)
+        indices_mesa = sorted(np.where(self.posicion_cartas == POS_MESA)[0],
+                              key=self._clave_orden_carta)
+
+        carta_jugada_idx = indices_mano[hand_slot]
         terminated = False
         truncated = False
         reward = 0.0
-        indices_mano = np.where(self.posicion_cartas == POS_MI_MANO)[0]
-        indices_mano = sorted(indices_mano, key=self._clave_orden_carta)
-        if len(indices_mano) == 0:
-            return self._get_obs(), 0, True, False, {}
-        if action >= len(indices_mano):
-            reward -= 0.5
-        idx_real_accion = min(action, len(indices_mano) - 1)
-        carta_jugada_idx = indices_mano[idx_real_accion]
-        num_c, es_oro_c, valor_c = self._obtener_info_carta(carta_jugada_idx)
-        indices_mesa = np.where(self.posicion_cartas == POS_MESA)[0]
-        cartas_llevadas_indices = self._buscar_mejor_jugada(valor_c, indices_mesa)
-        hizo_baza = False
-        es_escoba = False
-        if cartas_llevadas_indices is not None:
-            hizo_baza = True
-            cartas_a_mover = list(cartas_llevadas_indices) + [carta_jugada_idx]
+
+        if table_bitmask > 0:
+            combo_indices = [indices_mesa[i] for i in range(len(indices_mesa))
+                             if table_bitmask & (1 << i)]
+            cartas_a_mover = combo_indices + [carta_jugada_idx]
             self.posicion_cartas[cartas_a_mover] = POS_MIS_BAZAS
-            quedan_en_mesa = np.count_nonzero(self.posicion_cartas == POS_MESA)
-            if quedan_en_mesa == 0:
-                es_escoba = True
+            if np.count_nonzero(self.posicion_cartas == POS_MESA) == 0:
                 self.contadores["escobas_tu"] += 1
                 reward += 1.0
             for idx in cartas_a_mover:
@@ -279,53 +311,48 @@ class EscobaEnv(gym.Env):
             self.ultimo_en_bazar = "jugador"
         else:
             self.posicion_cartas[carta_jugada_idx] = POS_MESA
-        penalty_oponente = self._simular_turno_oponente()
-        reward += penalty_oponente
-        cartas_mano_jug = np.count_nonzero(self.posicion_cartas == POS_MI_MANO)
-        cartas_mano_op = np.count_nonzero(self.posicion_cartas == POS_MANO_OP)
-        if cartas_mano_jug == 0 and cartas_mano_op == 0:
-            mazo_vacio = self._repartir_nueva_ronda()
-            if mazo_vacio:
+
+        reward += self._simular_turno_oponente()
+
+        if (np.count_nonzero(self.posicion_cartas == POS_MI_MANO) == 0 and
+                np.count_nonzero(self.posicion_cartas == POS_MANO_OP) == 0):
+            if self._repartir_nueva_ronda():
                 terminated = True
                 self._limpieza_final()
                 reward += self._calcular_recompensa_final()
-        observation = self._get_obs()
-        info = self._get_info()
-        return observation, reward, terminated, truncated, info
+
+        return self._get_obs(), reward, terminated, truncated, self._get_info()
     
     def action_masks(self):
-        """Return boolean mask of valid actions (for MaskablePPO)."""
-        n_cards = int(np.count_nonzero(self.posicion_cartas == POS_MI_MANO))
-        mask = np.zeros(3, dtype=bool)
-        mask[:n_cards] = True
+        """Return 64-bool mask: True at each valid play index."""
+        plays = self._enumerate_valid_plays()
+        mask = np.zeros(64, dtype=bool)
+        mask[:len(plays)] = True
         return mask
 
     def greedy_player_action(self):
-        """Return action index (0-2) that greedy strategy would choose for the player."""
-        indices_mano_raw = np.where(self.posicion_cartas == POS_MI_MANO)[0]
-        if len(indices_mano_raw) == 0:
+        """Return index into _enumerate_valid_plays() that greedy would choose."""
+        plays = self._enumerate_valid_plays()
+        if not plays:
             return 0
-        indices_mano = sorted(indices_mano_raw, key=self._clave_orden_carta)
-        indices_mesa = np.where(self.posicion_cartas == POS_MESA)[0]
-
-        mejor_score = -1
-        mejor_slot = -1
-
-        for slot, carta_idx in enumerate(indices_mano):
-            _, _, valor_c = self._obtener_info_carta(carta_idx)
-            combo = self._buscar_mejor_jugada(valor_c, indices_mesa)
-            if combo is None:
-                continue
-            score = self._puntuar_jugada_greedy(carta_idx, combo, indices_mesa)
-            if score > mejor_score:
-                mejor_score = score
-                mejor_slot = slot
-
-        if mejor_slot == -1:
-            carta_a_tirar = self._elegir_carta_a_tirar(indices_mano)
-            mejor_slot = indices_mano.index(carta_a_tirar)
-
-        return mejor_slot
+        indices_mano = sorted(np.where(self.posicion_cartas == POS_MI_MANO)[0],
+                              key=self._clave_orden_carta)
+        indices_mesa = sorted(np.where(self.posicion_cartas == POS_MESA)[0],
+                              key=self._clave_orden_carta)
+        best_score = -1
+        best_idx = 0
+        for i, (slot, table_bitmask) in enumerate(plays):
+            carta_idx = indices_mano[slot]
+            if table_bitmask == 0:
+                score = 0
+            else:
+                combo_indices = tuple(indices_mesa[j] for j in range(len(indices_mesa))
+                                      if table_bitmask & (1 << j))
+                score = self._puntuar_jugada_greedy(carta_idx, combo_indices, indices_mesa)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        return best_idx
 
     def set_opponent(self, opponent_type):
         """Permite cambiar el tipo de oponente a mitad del entrenamiento."""
