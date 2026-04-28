@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import logging
+import multiprocessing
 import time
 from datetime import datetime
 
@@ -11,7 +12,7 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor, VecEnvWrapper
 from stable_baselines3.common.utils import set_random_seed
 
 from escoba_gym import EscobaEnv
@@ -24,7 +25,7 @@ CONFIG = {
     "bc_batch_size":    512,
     "bc_lr":            3e-4,
     "total_timesteps":  400_000_000,
-    "opponent_type":    "mixed",          # Ahora usamos el oponente mixto
+    "opponent_type":    "model",          # Ahora usamos el oponente mixto
     "curriculum_schedule": [
         # (Paso de entrenamiento, Probabilidad de ser Greedy)
         (0,           0.2),   # 0M:  20% Greedy desde el inicio
@@ -55,6 +56,10 @@ CONFIG = {
     "ent_coef_end":       0.008,  # Decae a exploración mínima al final
     "ent_decay_start":    20_000_000,   # Empieza cuando rival es ~60% greedy
     "ent_decay_end":      150_000_000,  # Termina de bajar
+    # ── Self-play ─────────────────────────────────────────────────────────────
+    "self_play_start_step":  50_000_000,   # Switch to self-play after greedy curriculum
+    "opponent_update_freq":   5_000_000,   # Reload best_model.zip every N steps
+    "eval_opponent":         "greedy",     # "greedy" or "model"
 }
 
 LOG_DIR    = "logs"       # TensorBoard logs  →  logs/PPO_N/
@@ -73,9 +78,15 @@ def linear_schedule(initial_value: float, final_value: float = 0.0):
 def _mask_fn(env):
     return env.action_masks()
 
-def make_env(env_id, opponent_type, seed=0):
+def make_env(env_id, opponent_type, seed=0, opp_request_queue=None, opp_response_queue=None):
     def _init():
-        env = EscobaEnv(render_mode=None, opponent_type=opponent_type)
+        env = EscobaEnv(
+            render_mode=None,
+            opponent_type=opponent_type,
+            env_id=env_id,
+            opp_request_queue=opp_request_queue,
+            opp_response_queue=opp_response_queue,
+        )
         env.reset(seed=seed + env_id)
         env = ActionMasker(env, _mask_fn)
         return env
@@ -114,6 +125,8 @@ class EscobaStatsCallback(BaseCallback):
         self._esc_op   = []
         self._cards_tu = []
         self._7oro     = []
+        self._sietes   = []
+        self._oros     = []
 
     def _on_step(self) -> bool:
         for info, done in zip(self.locals["infos"], self.locals["dones"]):
@@ -129,6 +142,8 @@ class EscobaStatsCallback(BaseCallback):
             self._esc_op.append(info.get("escobas_op", 0))
             self._cards_tu.append(info.get("cartas_tu", 0))
             self._7oro.append(info.get("tiene_7oro_tu", 0))
+            self._sietes.append(info.get("sietes_tu", 0))
+            self._oros.append(info.get("oros_tu", 0))
         return True
 
     def _on_rollout_end(self):
@@ -146,6 +161,8 @@ class EscobaStatsCallback(BaseCallback):
         self.logger.record("escoba/escobas_op", np.mean(self._esc_op))
         self.logger.record("escoba/cards_rate", np.mean(self._cards_tu) / 40.0)
         self.logger.record("escoba/7oro_rate",  np.mean(self._7oro))
+        self.logger.record("escoba/sietes_tu",  np.mean(self._sietes))
+        self.logger.record("escoba/oros_tu",    np.mean(self._oros))
         self._reset_buffers()
 
 
@@ -203,6 +220,97 @@ class DynamicEntCoefCallback(BaseCallback):
         # Registrar en TensorBoard para poder ver la curva cayendo
         self.logger.record("config/ent_coef", current_ent)
         return True
+
+class SelfPlayVecEnvWrapper(VecEnvWrapper):
+    """Sits between SubprocVecEnv and VecMonitor. Handles opponent inference
+    for all envs in a single batched forward pass. Only active after self-play
+    is enabled; otherwise transparent pass-through."""
+
+    def __init__(self, venv, opp_request_queue, opp_response_queues):
+        super().__init__(venv)
+        self.opp_request_queue = opp_request_queue
+        self.opp_response_queues = opp_response_queues
+        self.opponent = None
+        self.self_play_active = False
+
+    def step_async(self, actions):
+        self.venv.step_async(actions)
+
+    def step_wait(self):
+        if self.self_play_active:
+            # Drain exactly one request per env (env always pushes sentinel or obs)
+            requests = [self.opp_request_queue.get() for _ in range(self.num_envs)]
+
+            # Batch inference for envs that have cards to play
+            need = [(env_id, obs, masks)
+                    for env_id, obs, masks in requests if obs is not None]
+            if need:
+                if self.opponent is not None:
+                    obs_keys = list(need[0][1].keys())
+                    batch_obs = {k: np.stack([x[1][k] for x in need]) for k in obs_keys}
+                    batch_masks = np.stack([x[2] for x in need])
+                    actions_opp, _ = self.opponent.predict(
+                        batch_obs, action_masks=batch_masks, deterministic=True
+                    )
+                else:
+                    # Fallback: action 0 (should not happen in normal operation)
+                    actions_opp = np.zeros(len(need), dtype=np.int64)
+                for i, (env_id, _, _) in enumerate(need):
+                    self.opp_response_queues[env_id].put(int(actions_opp[i]))
+
+        return self.venv.step_wait()
+
+    def reset(self):
+        return self.venv.reset()
+
+    def load_opponent(self, model_path: str):
+        if os.path.exists(model_path):
+            self.opponent = MaskablePPO.load(model_path, device="cpu")
+            self.opponent.policy.set_training_mode(False)
+
+    def activate_self_play(self):
+        self.self_play_active = True
+
+
+class SelfPlayCallback(BaseCallback):
+    """Loads best_model.zip into the wrapper opponent every N steps.
+    Switches envs from greedy to model opponent at self_play_start_step."""
+
+    def __init__(self, wrapper: SelfPlayVecEnvWrapper, model_dir: str,
+                 self_play_start_step: int, opponent_update_freq: int, verbose: int = 1):
+        super().__init__(verbose)
+        self.wrapper = wrapper
+        self.model_dir = model_dir
+        self.self_play_start_step = self_play_start_step
+        self.opponent_update_freq = opponent_update_freq
+        # Negative so first eligible check fires immediately
+        self._last_update = -opponent_update_freq
+
+    def _best_model_path(self):
+        return os.path.join(self.model_dir, "best_model.zip")
+
+    def _on_step(self) -> bool:
+        t = self.num_timesteps
+
+        if not self.wrapper.self_play_active and t >= self.self_play_start_step:
+            path = self._best_model_path()
+            if os.path.exists(path):
+                self.wrapper.load_opponent(path)
+                self.wrapper.activate_self_play()
+                self.training_env.env_method("set_opponent", "model")
+                self._last_update = t
+                if self.verbose:
+                    print(f"\n[SelfPlay] Activated at step {t:,}. Opponent: {path}")
+
+        if self.wrapper.self_play_active and t - self._last_update >= self.opponent_update_freq:
+            path = self._best_model_path()
+            self.wrapper.load_opponent(path)
+            self._last_update = t
+            if self.verbose:
+                print(f"\n[SelfPlay] Opponent updated at step {t:,}.")
+
+        return True
+
 
 def collect_bc_data(n_steps: int, seed: int = 42) -> dict:
     """Run greedy vs greedy, record player observations and greedy actions."""
@@ -322,16 +430,31 @@ def entrenar(resume_from=None):
     # ── Entornos Paralelizados ──────────────────────────────────────────────
     opp = CONFIG["opponent_type"]
     num_envs = CONFIG["num_envs"]
-    
-    env = SubprocVecEnv([make_env(i, opp) for i in range(num_envs)])
-    env = VecMonitor(env, os.path.join(model_dir, "train_monitor"))
+
+    # Manager queues survive cloudpickle + spawn/forkserver (plain Queue FDs don't)
+    _mp_manager = multiprocessing.Manager()
+    opp_request_queue = _mp_manager.Queue()
+    opp_response_queues = [_mp_manager.Queue() for _ in range(num_envs)]
+
+    raw_env = SubprocVecEnv([
+        make_env(i, opp,
+                 opp_request_queue=opp_request_queue,
+                 opp_response_queue=opp_response_queues[i])
+        for i in range(num_envs)
+    ])
+    self_play_wrapper = SelfPlayVecEnvWrapper(raw_env, opp_request_queue, opp_response_queues)
+    # If envs start in model mode, wrapper must drain queues from step 0
+    if opp == "model":
+        self_play_wrapper.activate_self_play()
+    env = VecMonitor(self_play_wrapper, os.path.join(model_dir, "train_monitor"))
 
     # Aplicar prob_greedy inicial del curriculum (la callback solo actualiza en cambios de fase)
     initial_prob = CONFIG["curriculum_schedule"][0][1]
     env.env_method("set_prob_greedy", initial_prob)
 
-    # El evaluador SIEMPRE juega contra 100% greedy
-    eval_env = DummyVecEnv([make_env(99, "greedy")])
+    # Eval opponent: greedy (default) or model
+    eval_opp = CONFIG.get("eval_opponent", "greedy")
+    eval_env = DummyVecEnv([make_env(99, eval_opp)])
     eval_env = VecMonitor(eval_env, os.path.join(model_dir, "eval_monitor"))
 
     # ── Modelo ──────────────────────────────────────────────────────────────
@@ -401,13 +524,22 @@ def entrenar(resume_from=None):
         end_step=CONFIG["ent_decay_end"]
     )
 
+    self_play_callback = SelfPlayCallback(
+        wrapper=self_play_wrapper,
+        model_dir=model_dir,
+        self_play_start_step=CONFIG["self_play_start_step"],
+        opponent_update_freq=CONFIG["opponent_update_freq"],
+        verbose=1,
+    )
+
     # ── Entrenar ────────────────────────────────────────────────────────────
     logger.info(f"Iniciando entrenamiento: {CONFIG['total_timesteps']:,} pasos…")
     t0 = time.time()
 
     model.learn(
         total_timesteps=CONFIG["total_timesteps"],
-        callback=[eval_callback, stats_callback, curriculum_callback, entropy_callback],
+        callback=[eval_callback, stats_callback, curriculum_callback, entropy_callback,
+                  self_play_callback],
         tb_log_name="PPO",
         progress_bar=True,
         reset_num_timesteps=reset_num_timesteps,

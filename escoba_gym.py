@@ -32,7 +32,8 @@ class EscobaEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
 
     def __init__(self, render_mode=None, config_param=None,
-                 opponent_type="random", opponent_model=None):
+                 opponent_type="random", opponent_model=None,
+                 env_id=0, opp_request_queue=None, opp_response_queue=None):
         self.observation_space = spaces.Dict({
             "hand": spaces.Box(
                 low=0,
@@ -79,6 +80,9 @@ class EscobaEnv(gym.Env):
         self.opponent_type = opponent_type
         self.opponent_model = opponent_model
         self.prob_greedy = 0.0
+        self.env_id = env_id
+        self.opp_request_queue = opp_request_queue
+        self.opp_response_queue = opp_response_queue
 
 
     
@@ -207,6 +211,98 @@ class EscobaEnv(gym.Env):
             "globales": obs_globales,
             "played_cards": obs_played
         }
+    def _get_obs_opponent(self):
+        obs_hand = np.zeros(HAND_SIZE, dtype=np.int32)
+        indices_mano_op = sorted(np.where(self.posicion_cartas == POS_MANO_OP)[0],
+                                 key=self._clave_orden_carta)
+        for slot, idx in enumerate(indices_mano_op[:HAND_SIZE]):
+            obs_hand[slot] = int(idx) + 1
+
+        obs_table = np.zeros(MAX_TABLE_CARDS, dtype=np.int32)
+        indices_mesa = sorted(np.where(self.posicion_cartas == POS_MESA)[0],
+                              key=self._clave_orden_carta)
+        suma_mesa = 0
+        for slot, idx in enumerate(indices_mesa[:MAX_TABLE_CARDS]):
+            obs_table[slot] = int(idx) + 1
+            _, _, valor_juego = self._obtener_info_carta(idx)
+            suma_mesa += valor_juego
+
+        obs_globales = np.array([
+            self.contadores["sietes_tu"],       # 0  opponent sees its own sevens first
+            self.contadores["sietes_op"],       # 1
+            self.contadores["cartas_tu"],       # 2
+            self.contadores["cartas_op"],       # 3
+            self.contadores["oros_tu"],         # 4
+            self.contadores["oros_op"],         # 5
+            self.contadores["tiene_7oro_tu"],   # 6
+            self.contadores["tiene_7oro_op"],   # 7
+            self.contadores["escobas_tu"],      # 8
+            self.contadores["escobas_op"],      # 9
+            len(self.mazo),                     # 10
+            len(indices_mesa),                  # 11
+            suma_mesa                           # 12
+        ], dtype=np.int16)
+
+        obs_played = np.zeros(NUM_CARTAS, dtype=np.int8)
+        capturadas = (self.posicion_cartas == POS_MIS_BAZAS) | (self.posicion_cartas == POS_OP_BAZAS)
+        obs_played[capturadas] = 1
+
+        return {
+            "hand": obs_hand,
+            "table": obs_table,
+            "globales": obs_globales,
+            "played_cards": obs_played,
+        }
+
+    def _enumerate_valid_plays_opponent(self):
+        indices_mano = sorted(np.where(self.posicion_cartas == POS_MANO_OP)[0],
+                              key=self._clave_orden_carta)
+        indices_mesa = sorted(np.where(self.posicion_cartas == POS_MESA)[0],
+                              key=self._clave_orden_carta)
+        n_mesa = len(indices_mesa)
+        plays = []
+        for slot, carta_idx in enumerate(indices_mano):
+            _, _, valor_c = self._obtener_info_carta(carta_idx)
+            target = 15 - valor_c
+            card_has_capture = False
+            if n_mesa > 0 and target >= 0:
+                for mask in range(1, 1 << n_mesa):
+                    s = sum(_VALORES_JUEGO[indices_mesa[i]]
+                            for i in range(n_mesa) if mask & (1 << i))
+                    if s == target:
+                        plays.append((slot, mask))
+                        card_has_capture = True
+            if not card_has_capture:
+                plays.append((slot, 0))
+        return plays
+
+    def action_masks_opponent(self):
+        plays = self._enumerate_valid_plays_opponent()
+        mask = np.zeros(256, dtype=bool)
+        mask[:len(plays)] = True
+        return mask
+
+    def _execute_opponent_model_action(self, action_idx):
+        plays = self._enumerate_valid_plays_opponent()
+        if not plays:
+            return 0.0
+        action_idx = min(int(action_idx), len(plays) - 1)
+        hand_slot, table_bitmask = plays[action_idx]
+
+        indices_mano_op = sorted(np.where(self.posicion_cartas == POS_MANO_OP)[0],
+                                 key=self._clave_orden_carta)
+        indices_mesa = sorted(np.where(self.posicion_cartas == POS_MESA)[0],
+                              key=self._clave_orden_carta)
+
+        carta_idx = indices_mano_op[hand_slot]
+        if table_bitmask > 0:
+            combo_indices = [indices_mesa[i] for i in range(len(indices_mesa))
+                             if table_bitmask & (1 << i)]
+            return self._ejecutar_captura_oponente(carta_idx, combo_indices)
+        else:
+            self.posicion_cartas[carta_idx] = POS_MESA
+            return 0.0
+
     def _buscar_mejor_jugada(self, valor_carta_jugada, cartas_mesa_indices):
         """Búsqueda optimizada usando bitmasks."""
         target = 15 - valor_carta_jugada
@@ -375,7 +471,20 @@ class EscobaEnv(gym.Env):
             return self._turno_oponente_greedy()
         elif self.opponent_type == "mixed":
             return self._turno_oponente_mezclado()
+        elif self.opponent_type == "model":
+            return self._turno_oponente_model_queue()
         return 0.0
+
+    def _turno_oponente_model_queue(self):
+        indices_mano_op = np.where(self.posicion_cartas == POS_MANO_OP)[0]
+        if len(indices_mano_op) == 0:
+            self.opp_request_queue.put((self.env_id, None, None))
+            return 0.0
+        opp_obs = self._get_obs_opponent()
+        opp_masks = self.action_masks_opponent()
+        self.opp_request_queue.put((self.env_id, opp_obs, opp_masks))
+        action_idx = self.opp_response_queue.get()
+        return self._execute_opponent_model_action(action_idx)
 
     def _turno_oponente_mezclado(self):
         if self.np_random.random() < self.prob_greedy:
